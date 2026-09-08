@@ -8,10 +8,10 @@ const io = new Server(server, {
     cors: { origin: "*" }
 });
 
-// 생성된 방 목록 관리
-let rooms = {}; 
+// 방 정보 관리 { roomCode: { name, count, players: [] } }
+const rooms = {};
 
-function getRoomList() {
+function getPublicRoomList() {
     return Object.keys(rooms).map(code => ({
         code: code,
         name: rooms[code].name,
@@ -20,82 +20,103 @@ function getRoomList() {
 }
 
 io.on('connection', (socket) => {
-    // 로비에 접속 시 현재 방 목록 전송
-    socket.emit('updateRoomList', getRoomList());
+    // 1. 방 생성 (방 이름 중복 검사 포함)
+    socket.on('createRoom', (data) => {
+        const { code, name } = data;
 
-    // 방 만들기
-    socket.on('createRoom', ({ code, name }) => {
+        // 같은 이름의 방이 존재하는지 확인
+        const nameExists = Object.values(rooms).some(r => r.name === name);
+        if (nameExists) {
+            socket.emit('errorMsg', '이미 존재하는 방 이름입니다. 다른 이름을 사용해주세요.');
+            return;
+        }
+
         rooms[code] = {
-            name: name || `방-${code}`,
+            name: name,
             players: [socket.id]
         };
-        socket.join(code);
         socket.roomCode = code;
+        socket.join(code);
 
-        // 전체 플레이어에게 방 목록 갱신 전송
-        io.emit('updateRoomList', getRoomList());
+        io.emit('updateRoomList', getPublicRoomList());
     });
 
-    // 방 참가하기
-    socket.on('joinRoom', ({ code }) => {
+    // 2. 방 참가
+    socket.on('joinRoom', (data) => {
+        const { code } = data;
         const room = rooms[code];
+
         if (!room) {
-            return socket.emit('errorMsg', '존재하지 않는 방입니다.');
+            socket.emit('errorMsg', '존재하지 않는 방 코드입니다.');
+            return;
         }
+
         if (room.players.length >= 2) {
-            return socket.emit('errorMsg', '방이 가득 찼습니다.');
+            socket.emit('errorMsg', '방이 이미 가득 찼증니다.');
+            return;
         }
 
         room.players.push(socket.id);
-        socket.join(code);
         socket.roomCode = code;
+        socket.join(code);
 
-        io.emit('updateRoomList', getRoomList());
+        io.emit('updateRoomList', getPublicRoomList());
+        io.to(code).emit('gameStart');
+    });
 
-        // 2명이 모이면 게임 시작
-        if (room.players.length === 2) {
-            io.to(code).emit('gameStart');
+    // 3. 호스트 참가 취소
+    socket.on('cancelHost', () => {
+        if (socket.roomCode && rooms[socket.roomCode]) {
+            delete rooms[socket.roomCode];
+            socket.leave(socket.roomCode);
+            socket.roomCode = null;
+            io.emit('updateRoomList', getPublicRoomList());
         }
     });
 
-    // 이동 동기화
+    // 4. 플레이어 위치 및 시선 정보 전달
     socket.on('move', (data) => {
         if (socket.roomCode) {
             socket.to(socket.roomCode).emit('playerMoved', data);
         }
     });
 
-    // 피격 처리
+    // 5. 피격 판정
     socket.on('hit', (data) => {
         if (socket.roomCode) {
             socket.to(socket.roomCode).emit('takeDamage', data);
         }
     });
 
-    // 방장 대기 취소 또는 연결 종료
-    const leaveRoom = () => {
-        const code = socket.roomCode;
-        if (code && rooms[code]) {
-            rooms[code].players = rooms[code].players.filter(id => id !== socket.id);
-            if (rooms[code].players.length === 0) {
-                delete rooms[code];
+    // 6. 사망 알림
+    socket.on('iDied', () => {
+        if (socket.roomCode) {
+            socket.to(socket.roomCode).emit('enemyKilled');
+        }
+    });
+
+    // 7. 연결 해제
+    socket.disconnecting = () => {
+        if (socket.roomCode && rooms[socket.roomCode]) {
+            const room = rooms[socket.roomCode];
+            room.players = room.players.filter(id => id !== socket.id);
+
+            if (room.players.length === 0) {
+                delete rooms[socket.roomCode];
+            } else {
+                io.to(socket.roomCode).emit('errorMsg', '상대방이 게임을 나갔습니다.');
             }
-            io.emit('updateRoomList', getRoomList());
-            socket.leave(code);
-            socket.roomCode = null;
+            io.emit('updateRoomList', getPublicRoomList());
         }
     };
+});
 
-    socket.on('cancelHost', leaveRoom);
-    socket.on('disconnect', leaveRoom);
+// 초기 방 목록 전송
+io.on('connection', (socket) => {
+    socket.emit('updateRoomList', getPublicRoomList());
 });
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
     console.log(`Server running on port ${PORT}`);
-});// server.js 소켓 이벤트 내부
-socket.on('iDied', () => {
-    const roomCode = socket.roomCode;
-    // 나와 같은 방에 있는 상대방에게 enemyKilled 이벤트 전송
-    socket.to(roomCode).emit('enemyKilled');
 });
