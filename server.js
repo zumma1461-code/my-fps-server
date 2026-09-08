@@ -93,4 +93,9 @@ io.on('connection', (socket) => {
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
     console.log(`Server running on port ${PORT}`);
+});// server.js 소켓 이벤트 내부
+socket.on('iDied', () => {
+    const roomCode = socket.roomCode;
+    // 나와 같은 방에 있는 상대방에게 enemyKilled 이벤트 전송
+    socket.to(roomCode).emit('enemyKilled');
 });
