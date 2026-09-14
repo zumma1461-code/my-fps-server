@@ -8,6 +8,22 @@ const io = new Server(server, {
     cors: { origin: "*", methods: ["GET", "POST"] }
 });
 
+// ===== [추가] 계정 API / 버전 체크 설정 =====
+// 구글 앱스크립트(Code.gs)를 웹앱으로 배포한 뒤 나오는 URL로 반드시 교체하세요.
+const ACCOUNT_API_URL = 'https://script.google.com/macros/s/AKfycby7gNM97v9keZ-Y7MUnrtvtA2SZD7fOeBzH1wsx-dd3F08rPM-_WZm44zt_ayDTUFfAkA/exec';
+// 클라이언트가 이 버전이 아니면 "업데이트가 필요합니다" 안내를 보냄
+const REQUIRED_VERSION = 'Beta 1.0';
+
+// 앱스크립트 계정 API 호출 헬퍼
+async function callAccountApi(action, username, password) {
+    const res = await fetch(ACCOUNT_API_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action, username, password })
+    });
+    return res.json();
+}
+
 // 생성된 방 목록 관리 객체
 let rooms = {};
 
@@ -22,6 +38,36 @@ function getPublicRoomList() {
 io.on('connection', (socket) => {
     // 연결 시 현재 방 목록 전송
     socket.emit('updateRoomList', getPublicRoomList());
+
+    // [추가] 클라이언트 버전 확인 - 클라이언트가 접속 직후 자신의 버전을 보내면 비교
+    socket.on('checkVersion', (clientVersion) => {
+        if (clientVersion !== REQUIRED_VERSION) {
+            socket.emit('needUpdate', { required: REQUIRED_VERSION, current: clientVersion });
+        }
+    });
+
+    // [추가] 회원가입 요청 처리 - 앱스크립트 API에 위임, 결과를 그대로 클라이언트에 전달
+    socket.on('register', async (data) => {
+        try {
+            const result = await callAccountApi('register', data.username, data.password);
+            socket.emit('registerResult', result);
+        } catch (err) {
+            socket.emit('registerResult', { success: false, message: '계정 서버 연결 실패' });
+        }
+    });
+
+    // [추가] 로그인 요청 처리
+    socket.on('login', async (data) => {
+        try {
+            const result = await callAccountApi('login', data.username, data.password);
+            if (result.success) {
+                socket.username = data.username; // 이후 방/게임 로직에서 필요하면 사용
+            }
+            socket.emit('loginResult', result);
+        } catch (err) {
+            socket.emit('loginResult', { success: false, message: '계정 서버 연결 실패' });
+        }
+    });
 
     // 1. 방 만들기
     socket.on('createRoom', (data) => {
