@@ -12,7 +12,7 @@ const io = new Server(server, {
 // 구글 앱스크립트(Code.gs)를 웹앱으로 배포한 뒤 나오는 URL로 반드시 교체하세요.
 const ACCOUNT_API_URL = 'https://script.google.com/macros/s/AKfycby7gNM97v9keZ-Y7MUnrtvtA2SZD7fOeBzH1wsx-dd3F08rPM-_WZm44zt_ayDTUFfAkA/exec';
 // 클라이언트가 이 버전이 아니면 "업데이트가 필요합니다" 안내를 보냄
-const REQUIRED_VERSION = 'Beta 1.0';
+const REQUIRED_VERSION = 'Beta 1.1';
 
 // 앱스크립트 계정 API 호출 헬퍼 - payload 객체를 그대로 JSON으로 전달
 async function callAccountApi(payload) {
@@ -81,6 +81,25 @@ io.on('connection', (socket) => {
             socket.emit('profileUpdate', result);
         } catch (err) {
             // 전적 기록 실패는 게임 진행에 영향 주지 않도록 조용히 무시
+        }
+    });
+
+    // [추가] 비밀번호 변경 요청 처리 - 로그인한 사용자만 가능
+    socket.on('changePassword', async (data) => {
+        if (!socket.username) {
+            socket.emit('changePasswordResult', { success: false, message: '로그인이 필요합니다.' });
+            return;
+        }
+        try {
+            const result = await callAccountApi({
+                action: 'changePassword',
+                username: socket.username,
+                oldPassword: data.oldPassword,
+                newPassword: data.newPassword
+            });
+            socket.emit('changePasswordResult', result);
+        } catch (err) {
+            socket.emit('changePasswordResult', { success: false, message: '계정 서버 연결 실패' });
         }
     });
 
