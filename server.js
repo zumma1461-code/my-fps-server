@@ -10,16 +10,16 @@ const io = new Server(server, {
 
 // ===== [추가] 계정 API / 버전 체크 설정 =====
 // 구글 앱스크립트(Code.gs)를 웹앱으로 배포한 뒤 나오는 URL로 반드시 교체하세요.
-const ACCOUNT_API_URL = 'https://script.google.com/macros/s/AKfycby7gNM97v9keZ-Y7MUnrtvtA2SZD7fOeBzH1wsx-dd3F08rPM-_WZm44zt_ayDTUFfAkA/exec';
+const ACCOUNT_API_URL = 'https://script.google.com/macros/s/여기에_배포된_ID를_넣으세요/exec';
 // 클라이언트가 이 버전이 아니면 "업데이트가 필요합니다" 안내를 보냄
 const REQUIRED_VERSION = 'Beta 1.0';
 
-// 앱스크립트 계정 API 호출 헬퍼
-async function callAccountApi(action, username, password) {
+// 앱스크립트 계정 API 호출 헬퍼 - payload 객체를 그대로 JSON으로 전달
+async function callAccountApi(payload) {
     const res = await fetch(ACCOUNT_API_URL, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ action, username, password })
+        body: JSON.stringify(payload)
     });
     return res.json();
 }
@@ -49,7 +49,7 @@ io.on('connection', (socket) => {
     // [추가] 회원가입 요청 처리 - 앱스크립트 API에 위임, 결과를 그대로 클라이언트에 전달
     socket.on('register', async (data) => {
         try {
-            const result = await callAccountApi('register', data.username, data.password);
+            const result = await callAccountApi({ action: 'register', username: data.username, password: data.password });
             socket.emit('registerResult', result);
         } catch (err) {
             socket.emit('registerResult', { success: false, message: '계정 서버 연결 실패' });
@@ -59,13 +59,28 @@ io.on('connection', (socket) => {
     // [추가] 로그인 요청 처리
     socket.on('login', async (data) => {
         try {
-            const result = await callAccountApi('login', data.username, data.password);
+            const result = await callAccountApi({ action: 'login', username: data.username, password: data.password });
             if (result.success) {
-                socket.username = data.username; // 이후 방/게임 로직에서 필요하면 사용
+                socket.username = data.username; // 이후 방/게임 로직 및 전적 기록에 사용
             }
             socket.emit('loginResult', result);
         } catch (err) {
             socket.emit('loginResult', { success: false, message: '계정 서버 연결 실패' });
+        }
+    });
+
+    // [추가] 매치 종료 시 승/패 기록 - 로그인한 유저만 기록됨
+    socket.on('matchResult', async (data) => {
+        if (!socket.username) return;
+        try {
+            const result = await callAccountApi({
+                action: 'recordResult',
+                username: socket.username,
+                result: data.win ? 'win' : 'loss'
+            });
+            socket.emit('profileUpdate', result);
+        } catch (err) {
+            // 전적 기록 실패는 게임 진행에 영향 주지 않도록 조용히 무시
         }
     });
 
