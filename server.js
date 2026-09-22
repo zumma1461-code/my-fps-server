@@ -10,7 +10,7 @@ const io = new Server(server, {
 
 // ===== [추가] 계정 API / 버전 체크 설정 =====
 // 구글 앱스크립트(Code.gs)를 웹앱으로 배포한 뒤 나오는 URL로 반드시 교체하세요.
-const ACCOUNT_API_URL = 'https://script.google.com/macros/s/여기에_배포된_ID를_넣으세요/exec';
+const ACCOUNT_API_URL = 'https://script.google.com/macros/s/AKfycby7gNM97v9keZ-Y7MUnrtvtA2SZD7fOeBzH1wsx-dd3F08rPM-_WZm44zt_ayDTUFfAkA/exec';
 // 클라이언트가 이 버전이 아니면 "업데이트가 필요합니다" 안내를 보냄
 const REQUIRED_VERSION = 'Beta 1.0';
 
