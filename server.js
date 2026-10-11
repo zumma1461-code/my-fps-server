@@ -73,8 +73,60 @@ const LOCKED_RESULT = { success: false, message: '시도 횟수가 너무 많습
 // 생성된 방 목록 관리 객체
 let rooms = {};
 
+// ===== [추가] 친구 기능: 온라인 유저 / 대결 신청 관리 =====
+const onlineUsers = new Map();       // 아이디 -> 소켓 (로그인한 사람만, 같은 아이디가 다시 접속하면 최신 소켓으로 교체)
+const pendingChallenges = new Map(); // "신청자>대상" -> { from, to, timer }
+const CHALLENGE_TIMEOUT_MS = 30 * 1000;
+
+// 특정 유저와 관련된 대기 중인 대결 신청을 모두 취소하고 상대에게 알림
+function cancelChallengesFor(username, reasonForOther) {
+    for (const [key, ch] of Array.from(pendingChallenges.entries())) {
+        if (ch.from !== username && ch.to !== username) continue;
+        clearTimeout(ch.timer);
+        pendingChallenges.delete(key);
+        const otherName = ch.from === username ? ch.to : ch.from;
+        const otherSocket = onlineUsers.get(otherName);
+        if (!otherSocket) continue;
+        if (ch.from === username) otherSocket.emit('challengeCancelled', { from: username }); // 받은 쪽 팝업 닫기
+        else otherSocket.emit('challengeResult', { success: false, message: reasonForOther });  // 보낸 쪽에 안내
+    }
+}
+
+// 로그아웃/접속 종료 시 온라인 목록과 대기 중인 신청 정리
+function clearUserSession(socket) {
+    const name = socket.username;
+    if (!name) return;
+    if (onlineUsers.get(name) === socket) {
+        onlineUsers.delete(name);
+        cancelChallengesFor(name, `${name}님이 오프라인이 되었습니다.`);
+    }
+    socket.username = null;
+}
+
+// 친구 목록 + 각 친구의 온라인/게임 중 상태
+async function buildFriendList(username) {
+    const res = await callAccountApi({ action: 'getFriends', user: username });
+    if (!res || !res.success) return res || { success: false, message: '친구 목록을 불러오지 못했습니다.' };
+    const friends = (res.friends || []).map(name => {
+        const s = onlineUsers.get(name);
+        return { name, online: !!s, busy: !!(s && s.currentRoom) };
+    });
+    return { success: true, friends, incoming: res.incoming || [], outgoing: res.outgoing || [] };
+}
+
+function notifyFriendsChanged(...names) {
+    names.forEach(n => {
+        const s = onlineUsers.get(n);
+        if (s) s.emit('friendsChanged');
+    });
+}
+
+function cleanName(v) {
+    return String(v == null ? '' : v).trim().slice(0, 40);
+}
+
 function getPublicRoomList() {
-    return Object.keys(rooms).map(code => ({
+    return Object.keys(rooms).filter(code => !rooms[code].private).map(code => ({
         code: code,
         name: rooms[code].name,
         count: rooms[code].players.length
@@ -107,7 +159,9 @@ io.on('connection', (socket) => {
         try {
             const result = await callAccountApi({ action: 'login', username: data.username, password: data.password });
             if (result.success) {
-                socket.username = data.username; // 이후 방/게임 로직 및 전적 기록에 사용
+                clearUserSession(socket); // 같은 소켓으로 다른 계정에 다시 로그인하는 경우 이전 계정 정리
+                socket.username = String(data.username).trim(); // 이후 방/게임 로직 및 친구 기능에 사용
+                onlineUsers.set(socket.username, socket);
             }
             socket.emit('loginResult', result);
         } catch (err) {
@@ -115,19 +169,9 @@ io.on('connection', (socket) => {
         }
     });
 
-    // [추가] 매치 종료 시 승/패 기록 - 로그인한 유저만 기록됨
-    socket.on('matchResult', async (data) => {
-        if (!socket.username) return;
-        try {
-            const result = await callAccountApi({
-                action: 'recordResult',
-                username: socket.username,
-                result: data.win ? 'win' : 'loss'
-            });
-            socket.emit('profileUpdate', result);
-        } catch (err) {
-            // 전적 기록 실패는 게임 진행에 영향 주지 않도록 조용히 무시
-        }
+    // 로그아웃 - 온라인 목록에서 빼고 대기 중인 대결 신청을 정리
+    socket.on('logout', () => {
+        clearUserSession(socket);
     });
 
     // [추가] 비밀번호 변경 요청 처리 - 로그인한 사용자만 가능
@@ -236,6 +280,137 @@ io.on('connection', (socket) => {
         }
     });
 
+    // ===== [추가] 친구 기능 (로그인한 사용자만) =====
+    socket.on('getFriends', async () => {
+        if (!socket.username) { socket.emit('friendsData', { success: false, message: '로그인이 필요합니다.' }); return; }
+        try {
+            socket.emit('friendsData', await buildFriendList(socket.username));
+        } catch (err) {
+            socket.emit('friendsData', { success: false, message: '계정 서버 연결 실패' });
+        }
+    });
+
+    socket.on('friendRequest', async (data) => {
+        if (!socket.username) { socket.emit('friendActionResult', { success: false, message: '로그인이 필요합니다.' }); return; }
+        const to = cleanName(data && data.to);
+        try {
+            const result = await callAccountApi({ action: 'friendRequest', from: socket.username, to });
+            socket.emit('friendActionResult', result);
+            if (result && result.success) notifyFriendsChanged(socket.username, to);
+        } catch (err) {
+            socket.emit('friendActionResult', { success: false, message: '계정 서버 연결 실패' });
+        }
+    });
+
+    socket.on('friendRespond', async (data) => {
+        if (!socket.username) { socket.emit('friendActionResult', { success: false, message: '로그인이 필요합니다.' }); return; }
+        const from = cleanName(data && data.from);
+        try {
+            const result = await callAccountApi({ action: 'friendRespond', user: socket.username, from, accept: !!(data && data.accept) });
+            socket.emit('friendActionResult', result);
+            if (result && result.success) notifyFriendsChanged(socket.username, from);
+        } catch (err) {
+            socket.emit('friendActionResult', { success: false, message: '계정 서버 연결 실패' });
+        }
+    });
+
+    socket.on('friendRemove', async (data) => {
+        if (!socket.username) { socket.emit('friendActionResult', { success: false, message: '로그인이 필요합니다.' }); return; }
+        const other = cleanName(data && data.name);
+        try {
+            const result = await callAccountApi({ action: 'friendRemove', user: socket.username, other });
+            socket.emit('friendActionResult', result);
+            if (result && result.success) notifyFriendsChanged(socket.username, other);
+        } catch (err) {
+            socket.emit('friendActionResult', { success: false, message: '계정 서버 연결 실패' });
+        }
+    });
+
+    // 친구에게 1대1 대결 신청
+    socket.on('challengeFriend', async (data) => {
+        const fail = (message) => socket.emit('challengeResult', { success: false, message });
+        if (!socket.username) return fail('로그인이 필요합니다.');
+        const from = socket.username;
+        const to = cleanName(data && data.to);
+        if (!to || to === from) return fail('대결 상대가 올바르지 않습니다.');
+        if (socket.currentRoom) return fail('이미 방에 있습니다. 방에서 나간 뒤 신청하세요.');
+
+        const key = `${from}>${to}`;
+        if (pendingChallenges.has(key)) return fail('이미 신청했습니다. 응답을 기다려주세요.');
+        if (pendingChallenges.has(`${to}>${from}`)) return fail('상대가 먼저 신청했습니다. 받은 신청을 수락해주세요.');
+
+        let list;
+        try {
+            list = await callAccountApi({ action: 'getFriends', user: from });
+        } catch (err) {
+            return fail('계정 서버 연결 실패');
+        }
+        if (!list || !list.success || !(list.friends || []).includes(to)) return fail('친구에게만 신청할 수 있습니다.');
+
+        const target = onlineUsers.get(to);
+        if (!target) return fail(`${to}님은 오프라인입니다.`);
+        if (target.currentRoom) return fail(`${to}님은 게임 중이거나 방에서 대기 중입니다.`);
+        if (socket.currentRoom) return fail('이미 방에 있습니다. 방에서 나간 뒤 신청하세요.'); // 서버 응답을 기다리는 사이 방에 들어간 경우
+
+        const timer = setTimeout(() => {
+            pendingChallenges.delete(key);
+            socket.emit('challengeResult', { success: false, message: `${to}님이 응답하지 않았습니다.` });
+            target.emit('challengeCancelled', { from });
+        }, CHALLENGE_TIMEOUT_MS);
+        pendingChallenges.set(key, { from, to, timer });
+
+        target.emit('challengeReceived', { from, timeoutMs: CHALLENGE_TIMEOUT_MS });
+        socket.emit('challengeSent', { to });
+    });
+
+    // 받은 대결 신청에 수락/거절
+    socket.on('challengeRespond', (data) => {
+        if (!socket.username) return;
+        const me = socket.username;
+        const from = cleanName(data && data.from);
+        const key = `${from}>${me}`;
+        const ch = pendingChallenges.get(key);
+        if (!ch) {
+            socket.emit('challengeResult', { success: false, message: '만료되었거나 취소된 신청입니다.' });
+            return;
+        }
+        clearTimeout(ch.timer);
+        pendingChallenges.delete(key);
+
+        const challenger = onlineUsers.get(from);
+        if (!data || !data.accept) {
+            if (challenger) challenger.emit('challengeResult', { success: false, message: `${me}님이 거절했습니다.` });
+            return;
+        }
+        if (!challenger) {
+            socket.emit('challengeResult', { success: false, message: `${from}님이 오프라인입니다.` });
+            return;
+        }
+        if (challenger.currentRoom || socket.currentRoom) {
+            const msg = '방에 있는 중이라 대결을 시작할 수 없습니다.';
+            socket.emit('challengeResult', { success: false, message: msg });
+            challenger.emit('challengeResult', { success: false, message: msg });
+            return;
+        }
+
+        // 친구 전용 비공개 방을 만들어 두 사람을 바로 입장시킴 (방 목록에는 보이지 않음)
+        let code;
+        do { code = 'f' + Math.random().toString(36).slice(2, 8); } while (rooms[code]);
+        rooms[code] = { name: `${from} vs ${me}`, players: [challenger.id, socket.id], private: true };
+        challenger.join(code);
+        socket.join(code);
+        challenger.currentRoom = code;
+        socket.currentRoom = code;
+
+        challenger.emit('challengeMatchStart', { code, isHost: true });
+        socket.emit('challengeMatchStart', { code, isHost: false });
+        io.to(code).emit('gameStart');
+
+        // 두 사람이 받았거나 보낸 다른 신청은 모두 취소
+        cancelChallengesFor(from, `${from}님이 다른 대결을 시작했습니다.`);
+        cancelChallengesFor(me, `${me}님이 다른 대결을 시작했습니다.`);
+    });
+
     // 1. 방 만들기
     socket.on('createRoom', (data) => {
         const roomCode = data.code;
@@ -333,6 +508,7 @@ io.on('connection', (socket) => {
 
     // 접속 해제 처리
     socket.on('disconnect', () => {
+        clearUserSession(socket);
         const roomCode = socket.currentRoom;
         if (roomCode && rooms[roomCode]) {
             rooms[roomCode].players = rooms[roomCode].players.filter(id => id !== socket.id);
