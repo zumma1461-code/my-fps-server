@@ -1,19 +1,21 @@
+
+Server · JS
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
-
+ 
 const app = express();
 const server = http.createServer(app);
 const io = new Server(server, {
     cors: { origin: "*", methods: ["GET", "POST"] }
 });
-
+ 
 // ===== [추가] 계정 API / 버전 체크 설정 =====
 // 구글 앱스크립트(Code.gs)를 웹앱으로 배포한 뒤 나오는 URL로 반드시 교체하세요.
 const ACCOUNT_API_URL = 'https://script.google.com/macros/s/AKfycby7gNM97v9keZ-Y7MUnrtvtA2SZD7fOeBzH1wsx-dd3F08rPM-_WZm44zt_ayDTUFfAkA/exec';
 // 클라이언트가 이 버전이 아니면 "업데이트가 필요합니다" 안내를 보냄
 const REQUIRED_VERSION = 'Beta 1.2';
-
+ 
 // 앱스크립트 계정 API 호출 헬퍼 - payload 객체를 그대로 JSON으로 전달
 async function callAccountApi(payload) {
     let res;
@@ -36,14 +38,14 @@ async function callAccountApi(payload) {
         throw new Error('invalid response');
     }
 }
-
+ 
 // ===== [추가] 관리자 비밀번호 무차별 대입 방지 =====
 // 같은 IP에서 관리자 비밀번호를 5번 틀리면 1분간 시도를 막음 (Render 프록시 뒤라 x-forwarded-for 사용)
 const ADMIN_MAX_FAILS = 5;
 const ADMIN_LOCK_MS = 60 * 1000;
 const MAX_QUIZZES = 200;
 const adminFailMap = new Map(); // ip -> { count, until }
-
+ 
 function getClientIp(socket) {
     const xff = socket.handshake.headers['x-forwarded-for'];
     if (xff) return String(xff).split(',')[0].trim();
@@ -69,15 +71,15 @@ function clearAdminFail(ip) {
     adminFailMap.delete(ip);
 }
 const LOCKED_RESULT = { success: false, message: '시도 횟수가 너무 많습니다. 1분 후 다시 시도하세요.' };
-
+ 
 // 생성된 방 목록 관리 객체
 let rooms = {};
-
+ 
 // ===== [추가] 친구 기능: 온라인 유저 / 대결 신청 관리 =====
 const onlineUsers = new Map();       // 아이디 -> 소켓 (로그인한 사람만, 같은 아이디가 다시 접속하면 최신 소켓으로 교체)
 const pendingChallenges = new Map(); // "신청자>대상" -> { from, to, timer }
 const CHALLENGE_TIMEOUT_MS = 30 * 1000;
-
+ 
 // 특정 유저와 관련된 대기 중인 대결 신청을 모두 취소하고 상대에게 알림
 function cancelChallengesFor(username, reasonForOther) {
     for (const [key, ch] of Array.from(pendingChallenges.entries())) {
@@ -91,7 +93,7 @@ function cancelChallengesFor(username, reasonForOther) {
         else otherSocket.emit('challengeResult', { success: false, message: reasonForOther });  // 보낸 쪽에 안내
     }
 }
-
+ 
 // 로그아웃/접속 종료 시 온라인 목록과 대기 중인 신청 정리
 function clearUserSession(socket) {
     const name = socket.username;
@@ -99,10 +101,44 @@ function clearUserSession(socket) {
     if (onlineUsers.get(name) === socket) {
         onlineUsers.delete(name);
         cancelChallengesFor(name, `${name}님이 오프라인이 되었습니다.`);
+        broadcastPresence(name); // 친구들에게 오프라인 알림 (온라인 목록에서 뺀 뒤에 보내야 offline으로 전달됨)
     }
     socket.username = null;
+    socket.friendSet = null;
 }
-
+ 
+// [추가] 내 친구들에게 내 상태(온라인/게임 중)가 바뀌었음을 바로 알림
+// 각 소켓이 자기 친구 이름 집합(friendSet)을 들고 있어서, 매번 계정 서버를 부르지 않고도 즉시 보낼 수 있음
+async function loadFriendSet(sock) {
+    if (!sock || !sock.username) return;
+    try {
+        const res = await callAccountApi({ action: 'getFriends', user: sock.username });
+        if (res && res.success) sock.friendSet = new Set(res.friends || []);
+    } catch (err) {
+        // 실패하면 이전 집합 유지 (다음 친구 변경/로그인 때 다시 시도)
+    }
+}
+ 
+function broadcastPresence(username) {
+    if (!username) return;
+    const self = onlineUsers.get(username);
+    const payload = { name: username, online: !!self, busy: !!(self && self.currentRoom) };
+    for (const s of onlineUsers.values()) {
+        if (s !== self && s.friendSet && s.friendSet.has(username)) s.emit('presence', payload);
+    }
+}
+ 
+// 친구 관계가 바뀐 뒤: 두 사람의 친구 집합을 새로 읽고, 목록 새로고침 + 서로의 현재 상태를 알림
+async function afterFriendMutation(a, b) {
+    const sa = onlineUsers.get(a);
+    const sb = onlineUsers.get(b);
+    await Promise.all([loadFriendSet(sa), loadFriendSet(sb)]);
+    if (sa) sa.emit('friendsChanged');
+    if (sb) sb.emit('friendsChanged');
+    broadcastPresence(a);
+    broadcastPresence(b);
+}
+ 
 // 친구 목록 + 각 친구의 온라인/게임 중 상태
 async function buildFriendList(username) {
     const res = await callAccountApi({ action: 'getFriends', user: username });
@@ -113,18 +149,11 @@ async function buildFriendList(username) {
     });
     return { success: true, friends, incoming: res.incoming || [], outgoing: res.outgoing || [] };
 }
-
-function notifyFriendsChanged(...names) {
-    names.forEach(n => {
-        const s = onlineUsers.get(n);
-        if (s) s.emit('friendsChanged');
-    });
-}
-
+ 
 function cleanName(v) {
     return String(v == null ? '' : v).trim().slice(0, 40);
 }
-
+ 
 function getPublicRoomList() {
     return Object.keys(rooms).filter(code => !rooms[code].private).map(code => ({
         code: code,
@@ -132,18 +161,18 @@ function getPublicRoomList() {
         count: rooms[code].players.length
     }));
 }
-
+ 
 io.on('connection', (socket) => {
     // 연결 시 현재 방 목록 전송
     socket.emit('updateRoomList', getPublicRoomList());
-
+ 
     // [추가] 클라이언트 버전 확인 - 클라이언트가 접속 직후 자신의 버전을 보내면 비교
     socket.on('checkVersion', (clientVersion) => {
         if (clientVersion !== REQUIRED_VERSION) {
             socket.emit('needUpdate', { required: REQUIRED_VERSION, current: clientVersion });
         }
     });
-
+ 
     // [추가] 회원가입 요청 처리 - 앱스크립트 API에 위임, 결과를 그대로 클라이언트에 전달
     socket.on('register', async (data) => {
         try {
@@ -153,7 +182,7 @@ io.on('connection', (socket) => {
             socket.emit('registerResult', { success: false, message: '계정 서버 연결 실패' });
         }
     });
-
+ 
     // [추가] 로그인 요청 처리
     socket.on('login', async (data) => {
         try {
@@ -162,18 +191,20 @@ io.on('connection', (socket) => {
                 clearUserSession(socket); // 같은 소켓으로 다른 계정에 다시 로그인하는 경우 이전 계정 정리
                 socket.username = String(data.username).trim(); // 이후 방/게임 로직 및 친구 기능에 사용
                 onlineUsers.set(socket.username, socket);
+                broadcastPresence(socket.username); // 친구들에게 온라인 알림
+                loadFriendSet(socket);              // 내 친구 집합은 비동기로 불러옴
             }
             socket.emit('loginResult', result);
         } catch (err) {
             socket.emit('loginResult', { success: false, message: '계정 서버 연결 실패' });
         }
     });
-
+ 
     // 로그아웃 - 온라인 목록에서 빼고 대기 중인 대결 신청을 정리
     socket.on('logout', () => {
         clearUserSession(socket);
     });
-
+ 
     // [추가] 비밀번호 변경 요청 처리 - 로그인한 사용자만 가능
     socket.on('changePassword', async (data) => {
         if (!socket.username) {
@@ -192,7 +223,7 @@ io.on('connection', (socket) => {
             socket.emit('changePasswordResult', { success: false, message: '계정 서버 연결 실패' });
         }
     });
-
+ 
     // [추가] 계정 설정 저장/불러오기 - 로그인한 사용자만 가능 (형식 검사는 Code.gs에서도 한 번 더 함)
     socket.on('saveSettings', async (data) => {
         if (!socket.username) {
@@ -211,7 +242,7 @@ io.on('connection', (socket) => {
             socket.emit('saveSettingsResult', { success: false, message: '계정 서버 연결 실패' });
         }
     });
-
+ 
     socket.on('getSettings', async () => {
         if (!socket.username) {
             socket.emit('settingsData', { success: false, message: '로그인이 필요합니다.' });
@@ -224,7 +255,7 @@ io.on('connection', (socket) => {
             socket.emit('settingsData', { success: false, message: '계정 서버 연결 실패' });
         }
     });
-
+ 
     // [수정] 퀴즈 문제 조회 - 문제 개수 제한 없음 (실패 시 빈 목록)
     socket.on('getQuizzes', async () => {
         try {
@@ -234,7 +265,7 @@ io.on('connection', (socket) => {
             socket.emit('quizzesData', { success: false, quizzes: [] });
         }
     });
-
+ 
     // [추가] 관리자 비밀번호 확인 전용 - 저장 없이 맞는지만 확인 (퀴즈 관리 화면 입장용)
     socket.on('verifyQuizAdmin', async (data) => {
         const ip = getClientIp(socket);
@@ -254,7 +285,7 @@ io.on('connection', (socket) => {
             socket.emit('verifyQuizAdminResult', { success: false, message: '계정 서버 연결 실패' });
         }
     });
-
+ 
     // [수정] 퀴즈 저장 - 관리자 비밀번호는 Code.gs에서 최종 검증
     socket.on('saveQuizzes', async (data) => {
         const ip = getClientIp(socket);
@@ -279,7 +310,7 @@ io.on('connection', (socket) => {
             socket.emit('saveQuizzesResult', { success: false, message: '계정 서버 연결 실패' });
         }
     });
-
+ 
     // ===== [추가] 친구 기능 (로그인한 사용자만) =====
     socket.on('getFriends', async () => {
         if (!socket.username) { socket.emit('friendsData', { success: false, message: '로그인이 필요합니다.' }); return; }
@@ -289,43 +320,43 @@ io.on('connection', (socket) => {
             socket.emit('friendsData', { success: false, message: '계정 서버 연결 실패' });
         }
     });
-
+ 
     socket.on('friendRequest', async (data) => {
         if (!socket.username) { socket.emit('friendActionResult', { success: false, message: '로그인이 필요합니다.' }); return; }
         const to = cleanName(data && data.to);
         try {
             const result = await callAccountApi({ action: 'friendRequest', from: socket.username, to });
             socket.emit('friendActionResult', result);
-            if (result && result.success) notifyFriendsChanged(socket.username, to);
+            if (result && result.success) afterFriendMutation(socket.username, to);
         } catch (err) {
             socket.emit('friendActionResult', { success: false, message: '계정 서버 연결 실패' });
         }
     });
-
+ 
     socket.on('friendRespond', async (data) => {
         if (!socket.username) { socket.emit('friendActionResult', { success: false, message: '로그인이 필요합니다.' }); return; }
         const from = cleanName(data && data.from);
         try {
             const result = await callAccountApi({ action: 'friendRespond', user: socket.username, from, accept: !!(data && data.accept) });
             socket.emit('friendActionResult', result);
-            if (result && result.success) notifyFriendsChanged(socket.username, from);
+            if (result && result.success) afterFriendMutation(socket.username, from);
         } catch (err) {
             socket.emit('friendActionResult', { success: false, message: '계정 서버 연결 실패' });
         }
     });
-
+ 
     socket.on('friendRemove', async (data) => {
         if (!socket.username) { socket.emit('friendActionResult', { success: false, message: '로그인이 필요합니다.' }); return; }
         const other = cleanName(data && data.name);
         try {
             const result = await callAccountApi({ action: 'friendRemove', user: socket.username, other });
             socket.emit('friendActionResult', result);
-            if (result && result.success) notifyFriendsChanged(socket.username, other);
+            if (result && result.success) afterFriendMutation(socket.username, other);
         } catch (err) {
             socket.emit('friendActionResult', { success: false, message: '계정 서버 연결 실패' });
         }
     });
-
+ 
     // 친구에게 1대1 대결 신청
     socket.on('challengeFriend', async (data) => {
         const fail = (message) => socket.emit('challengeResult', { success: false, message });
@@ -334,11 +365,11 @@ io.on('connection', (socket) => {
         const to = cleanName(data && data.to);
         if (!to || to === from) return fail('대결 상대가 올바르지 않습니다.');
         if (socket.currentRoom) return fail('이미 방에 있습니다. 방에서 나간 뒤 신청하세요.');
-
+ 
         const key = `${from}>${to}`;
         if (pendingChallenges.has(key)) return fail('이미 신청했습니다. 응답을 기다려주세요.');
         if (pendingChallenges.has(`${to}>${from}`)) return fail('상대가 먼저 신청했습니다. 받은 신청을 수락해주세요.');
-
+ 
         let list;
         try {
             list = await callAccountApi({ action: 'getFriends', user: from });
@@ -346,23 +377,23 @@ io.on('connection', (socket) => {
             return fail('계정 서버 연결 실패');
         }
         if (!list || !list.success || !(list.friends || []).includes(to)) return fail('친구에게만 신청할 수 있습니다.');
-
+ 
         const target = onlineUsers.get(to);
         if (!target) return fail(`${to}님은 오프라인입니다.`);
         if (target.currentRoom) return fail(`${to}님은 게임 중이거나 방에서 대기 중입니다.`);
         if (socket.currentRoom) return fail('이미 방에 있습니다. 방에서 나간 뒤 신청하세요.'); // 서버 응답을 기다리는 사이 방에 들어간 경우
-
+ 
         const timer = setTimeout(() => {
             pendingChallenges.delete(key);
             socket.emit('challengeResult', { success: false, message: `${to}님이 응답하지 않았습니다.` });
             target.emit('challengeCancelled', { from });
         }, CHALLENGE_TIMEOUT_MS);
         pendingChallenges.set(key, { from, to, timer });
-
+ 
         target.emit('challengeReceived', { from, timeoutMs: CHALLENGE_TIMEOUT_MS });
         socket.emit('challengeSent', { to });
     });
-
+ 
     // 받은 대결 신청에 수락/거절
     socket.on('challengeRespond', (data) => {
         if (!socket.username) return;
@@ -376,7 +407,7 @@ io.on('connection', (socket) => {
         }
         clearTimeout(ch.timer);
         pendingChallenges.delete(key);
-
+ 
         const challenger = onlineUsers.get(from);
         if (!data || !data.accept) {
             if (challenger) challenger.emit('challengeResult', { success: false, message: `${me}님이 거절했습니다.` });
@@ -392,7 +423,7 @@ io.on('connection', (socket) => {
             challenger.emit('challengeResult', { success: false, message: msg });
             return;
         }
-
+ 
         // 친구 전용 비공개 방을 만들어 두 사람을 바로 입장시킴 (방 목록에는 보이지 않음)
         let code;
         do { code = 'f' + Math.random().toString(36).slice(2, 8); } while (rooms[code]);
@@ -401,16 +432,19 @@ io.on('connection', (socket) => {
         socket.join(code);
         challenger.currentRoom = code;
         socket.currentRoom = code;
-
+ 
         challenger.emit('challengeMatchStart', { code, isHost: true });
         socket.emit('challengeMatchStart', { code, isHost: false });
         io.to(code).emit('gameStart');
-
+ 
+        broadcastPresence(from);
+        broadcastPresence(me);
+ 
         // 두 사람이 받았거나 보낸 다른 신청은 모두 취소
         cancelChallengesFor(from, `${from}님이 다른 대결을 시작했습니다.`);
         cancelChallengesFor(me, `${me}님이 다른 대결을 시작했습니다.`);
     });
-
+ 
     // 1. 방 만들기
     socket.on('createRoom', (data) => {
         const roomCode = data.code;
@@ -418,40 +452,42 @@ io.on('connection', (socket) => {
         const roomName = (data.name && data.name.trim() !== '') 
             ? data.name.trim() 
             : `매치 - ${roomCode}`;
-
+ 
         rooms[roomCode] = {
             name: roomName,
             players: [socket.id]
         };
-
+ 
         socket.join(roomCode);
         socket.currentRoom = roomCode;
         io.emit('updateRoomList', getPublicRoomList());
+        broadcastPresence(socket.username);
     });
-
+ 
     // 2. 방 참가하기
     socket.on('joinRoom', (data) => {
         const roomCode = data.code;
         const room = rooms[roomCode];
-
+ 
         if (!room) {
             socket.emit('errorMsg', '존재하지 않는 방입니다.');
             return;
         }
-
+ 
         if (room.players.length >= 2) {
             socket.emit('errorMsg', '방이 이미 가득 찼습니다.');
             return;
         }
-
+ 
         room.players.push(socket.id);
         socket.join(roomCode);
         socket.currentRoom = roomCode;
-
+ 
         io.emit('updateRoomList', getPublicRoomList());
         io.to(roomCode).emit('gameStart');
+        broadcastPresence(socket.username);
     });
-
+ 
     // 3. 방 나가기 및 취소 (유령 방 문제 완벽 해결)
     socket.on('leaveRoom', (data) => {
         const roomCode = data.code || socket.currentRoom;
@@ -467,12 +503,13 @@ io.on('connection', (socket) => {
             } else {
                 io.to(roomCode).emit('playerLeft');
             }
-
+ 
             socket.currentRoom = null;
             io.emit('updateRoomList', getPublicRoomList());
+            broadcastPresence(socket.username);
         }
     });
-
+ 
     // 동기화 이벤트
     // [수정] 위치 패킷은 volatile로 전달 - 받는 쪽 연결이 밀려 있으면 오래된 위치는 쌓지 않고 버림
     // (쌓아뒀다가 한꺼번에 도착하면 상대가 순간이동/되감기처럼 보이는 원인이 됨)
@@ -481,31 +518,31 @@ io.on('connection', (socket) => {
             socket.to(socket.currentRoom).volatile.emit('playerMoved', data);
         }
     });
-
+ 
     socket.on('weaponChange', (data) => {
         if (socket.currentRoom) {
             socket.to(socket.currentRoom).emit('enemyWeaponChanged', data);
         }
     });
-
+ 
     socket.on('enemyShoot', (data) => {
         if (socket.currentRoom) {
             socket.to(socket.currentRoom).emit('enemyFired', data);
         }
     });
-
+ 
     socket.on('hit', (data) => {
         if (socket.currentRoom) {
             socket.to(socket.currentRoom).emit('takeDamage', data);
         }
     });
-
+ 
     socket.on('iDied', () => {
         if (socket.currentRoom) {
             socket.to(socket.currentRoom).emit('enemyKilled');
         }
     });
-
+ 
     // 접속 해제 처리
     socket.on('disconnect', () => {
         clearUserSession(socket);
@@ -521,8 +558,14 @@ io.on('connection', (socket) => {
         }
     });
 });
-
+ 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
     console.log(`Server running on port ${PORT}`);
 });
+ 
+
+
+
+
+
