@@ -20,7 +20,7 @@ process.on('uncaughtException', (e) => console.error('[uncaughtException]', e));
 // 구글 앱스크립트(Code.gs)를 웹앱으로 배포한 뒤 나오는 URL로 반드시 교체하세요.
 const ACCOUNT_API_URL = 'https://script.google.com/macros/s/AKfycby7gNM97v9keZ-Y7MUnrtvtA2SZD7fOeBzH1wsx-dd3F08rPM-_WZm44zt_ayDTUFfAkA/exec';
 // 클라이언트가 이 버전이 아니면 "업데이트가 필요합니다" 안내를 보냄
-const REQUIRED_VERSION = 'Beta 1.2';
+const REQUIRED_VERSION = 'Beta 1.3';
 
 const API_TIMEOUT_MS = 20 * 1000;                                  // 앱스크립트가 처음 깰 때 느릴 수 있어 넉넉하게
 const READ_ACTIONS = new Set(['getFriends', 'getQuizzes', 'getSettings']); // 실패 시 한 번 더 시도해도 안전한 읽기 요청
@@ -391,10 +391,22 @@ io.on('connection', (socket) => {
     // 연결 시 현재 방 목록 전송
     socket.emit('updateRoomList', getPublicRoomList());
 
+    // [수정] 버전이 맞지 않는 클라이언트는 로그인/회원가입/비회원 멀티플레이/관전 등 모든 요청을 서버가 거부함
+    // (버전 확인 요청, 접속 직후 자동으로 가는 퀴즈 조회/핑 확인만 확인 전에 허용)
+    socket.use((packet, next) => {
+        const ev = packet[0];
+        if (socket.versionOk === true || ev === 'checkVersion') return next();
+        if (socket.versionOk === undefined && (ev === 'getQuizzes' || ev === 'pingCheck')) return next();
+        socket.emit('needUpdate', { required: REQUIRED_VERSION, current: socket.clientVersion || '알 수 없음' });
+        // next()를 부르지 않으면 이 요청은 버려짐
+    });
+
     // 클라이언트 버전 확인 - 클라이언트가 접속 직후 자신의 버전을 보내면 비교
     socket.on('checkVersion', (clientVersion) => {
-        if (clientVersion !== REQUIRED_VERSION) {
-            socket.emit('needUpdate', { required: REQUIRED_VERSION, current: clientVersion });
+        socket.clientVersion = String(clientVersion == null ? '' : clientVersion).slice(0, 40);
+        socket.versionOk = socket.clientVersion === REQUIRED_VERSION;
+        if (!socket.versionOk) {
+            socket.emit('needUpdate', { required: REQUIRED_VERSION, current: socket.clientVersion });
         }
     });
 
@@ -868,9 +880,11 @@ io.on('connection', (socket) => {
         const room = rooms[code];
         const idx = room ? room.players.indexOf(socket.id) : -1;
         if (idx >= 0 && data) {
-            const pos = { x: data.x, y: data.y, z: data.z, yaw: data.yaw };
+            // 관전자가 1인칭으로 볼 수 있도록 시선 위아래(pitch)도 함께 전달 (숫자로 보정)
+            const num = (v) => (Number.isFinite(Number(v)) ? Number(v) : 0);
+            const pos = { x: num(data.x), y: num(data.y), z: num(data.z), yaw: num(data.yaw), pitch: Math.max(-1.6, Math.min(1.6, num(data.pitch))) };
             room.last[idx] = pos;
-            specEmit(code, room, 'specMove', { i: idx, x: pos.x, y: pos.y, z: pos.z, yaw: pos.yaw }, true);
+            specEmit(code, room, 'specMove', { i: idx, x: pos.x, y: pos.y, z: pos.z, yaw: pos.yaw, pitch: pos.pitch }, true);
         }
     });
 
