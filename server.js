@@ -204,6 +204,7 @@ function clearUserSession(socket) {
         onlineUsers.delete(name);
         friendCache.delete(name); // 접속 중인 사람만 캐시를 유지 (메모리 정리)
         cancelChallengesFor(name, `${name}님이 오프라인이 되었습니다.`);
+        cancelInvitesFor(name, `${name}님이 오프라인이 되었습니다.`);
         broadcastPresence(name); // 친구들에게 오프라인 알림 (온라인 목록에서 뺀 뒤에 보내야 offline으로 전달됨)
     }
     socket.username = null;
@@ -258,20 +259,115 @@ function cleanName(v) {
     return String(v == null ? '' : v).trim().slice(0, 40);
 }
 
+// [수정] 친구 대결 방(private)도 목록에 포함 - 이미 2명이 있어서 참가는 못 하지만 관전할 수 있음
 function getPublicRoomList() {
-    return Object.keys(rooms).filter(code => !rooms[code].private).map(code => ({
+    return Object.keys(rooms).map(code => ({
         code: code,
         name: rooms[code].name,
-        count: rooms[code].players.length
+        count: rooms[code].players.length,
+        friend: !!rooms[code].private,
+        spectators: rooms[code].spectators.size
     }));
+}
+
+// [추가] 방 객체 생성 - 관전자/관전용 상태(마지막 위치, 무기, 체력, 점수)를 함께 보관
+function makeRoom(name, players, isPrivate) {
+    return {
+        name,
+        players,
+        private: !!isPrivate,
+        spectators: new Set(),     // 관전 중인 소켓 id
+        last: [null, null],        // 두 플레이어의 마지막 위치 (늦게 들어온 관전자에게 바로 보여주기 위함)
+        weapon: [1, 1],
+        hp: [100, 100],
+        score: [0, 0],
+        resetTimer: null
+    };
 }
 
 function broadcastRoomList() {
     io.emit('updateRoomList', getPublicRoomList());
 }
 
-// [추가] 소켓을 현재 방에서 빼는 공통 처리 (방 나가기 / 접속 종료 / 다른 방으로 이동할 때 공용)
-// 남은 인원이 없으면 방 삭제, 있으면 상대에게 playerLeft 알림
+// ===== [추가] 관전 =====
+const MAX_SPECTATORS = 10;
+const specChannel = (code) => code + '#s';
+
+// 관전자에게만 보내는 이벤트 (관전자가 없으면 아무것도 안 함)
+function specEmit(code, room, event, payload, volatile) {
+    if (!room || room.spectators.size === 0) return;
+    const target = io.to(specChannel(code));
+    (volatile ? target.volatile : target).emit(event, payload);
+}
+
+function playerNameAt(room, i) {
+    const s = io.sockets.sockets.get(room.players[i]);
+    return (s && s.username) ? s.username : `플레이어 ${i + 1}`;
+}
+
+// 소켓 하나를 관전에서 빼기
+function stopSpectating(socket) {
+    const code = socket.spectating;
+    if (!code) return false;
+    socket.spectating = null;
+    socket.leave(specChannel(code));
+    const room = rooms[code];
+    if (room) {
+        room.spectators.delete(socket.id);
+        broadcastRoomList();
+    }
+    return true;
+}
+
+// 경기가 끝나거나 플레이어가 나가면 관전자를 모두 내보냄
+function endRoomSpectators(code, room, reason) {
+    if (!room || room.spectators.size === 0) return;
+    for (const id of Array.from(room.spectators)) {
+        const s = io.sockets.sockets.get(id);
+        if (s) {
+            s.leave(specChannel(code));
+            s.spectating = null;
+            s.emit('spectateEnded', { reason });
+        }
+    }
+    room.spectators.clear();
+}
+
+// ===== [추가] 친구 초대 (방 만들고 대기 중일 때 친구를 부름) =====
+const pendingInvites = new Map(); // "초대한사람>받는사람" -> { from, to, code, timer }
+const INVITE_TIMEOUT_MS = 30 * 1000;
+
+// 초대 하나를 취소하고 받는 사람 팝업을 닫음 (inviterMsg가 있으면 초대한 사람에게도 알림)
+function dropInvite(key, inviterMsg) {
+    const inv = pendingInvites.get(key);
+    if (!inv) return;
+    clearTimeout(inv.timer);
+    pendingInvites.delete(key);
+    const target = onlineUsers.get(inv.to);
+    if (target) target.emit('inviteCancelled', { from: inv.from });
+    if (inviterMsg) {
+        const inviter = onlineUsers.get(inv.from);
+        if (inviter) inviter.emit('inviteResult', { success: false, message: inviterMsg, to: inv.to });
+    }
+}
+
+// 접속 종료/로그아웃한 사람이 보냈거나 받은 초대를 모두 정리
+function cancelInvitesFor(username, reasonForInviter) {
+    for (const [key, inv] of Array.from(pendingInvites.entries())) {
+        if (inv.from === username) dropInvite(key);
+        else if (inv.to === username) dropInvite(key, reasonForInviter);
+    }
+}
+
+// 방이 가득 찼거나 사라지면 그 방으로 보낸 초대를 모두 취소
+function cancelInvitesForRoom(code) {
+    for (const [key, inv] of Array.from(pendingInvites.entries())) {
+        if (inv.code === code) dropInvite(key);
+    }
+}
+
+// 소켓을 현재 방에서 빼는 공통 처리 (방 나가기 / 접속 종료 / 다른 방으로 이동할 때 공용)
+// 남은 인원이 없으면 방 삭제, 있으면 상대에게 playerLeft 알림. 관전자는 경기가 끝났으므로 내보냄
 function removeFromRoom(socket) {
     const code = socket.currentRoom;
     if (!code) return false;
@@ -281,10 +377,13 @@ function removeFromRoom(socket) {
 
     socket.leave(code);
     room.players = room.players.filter(id => id !== socket.id);
+    cancelInvitesForRoom(code);
+    endRoomSpectators(code, room, '플레이어가 나가서 경기가 끝났습니다.');
+    clearTimeout(room.resetTimer);
     if (room.players.length === 0) delete rooms[code];
     else io.to(code).emit('playerLeft');
 
-    if (!room.private) broadcastRoomList(); // 친구 대결 방은 방 목록에 안 보이므로 알릴 필요 없음
+    broadcastRoomList(); // 친구 대결 방도 목록에 보이므로 항상 알림
     return true;
 }
 
@@ -511,7 +610,7 @@ io.on('connection', (socket) => {
 
         const target = onlineUsers.get(to);
         if (!target) return fail(`${to}님은 오프라인입니다.`);
-        if (target.currentRoom) return fail(`${to}님은 게임 중이거나 방에서 대기 중입니다.`);
+        if (target.currentRoom || target.spectating) return fail(`${to}님은 게임 중이거나 방에서 대기 중입니다.`);
         if (socket.currentRoom) return fail('이미 방에 있습니다. 방에서 나간 뒤 신청하세요.'); // 응답을 기다리는 사이 방에 들어간 경우
         if (pendingChallenges.has(key)) return fail('이미 신청했습니다. 응답을 기다려주세요.'); // 대기 중에 같은 신청이 겹친 경우
 
@@ -559,7 +658,7 @@ io.on('connection', (socket) => {
         // 친구 전용 비공개 방을 만들어 두 사람을 바로 입장시킴 (방 목록에는 보이지 않음)
         let code;
         do { code = 'f' + Math.random().toString(36).slice(2, 8); } while (rooms[code]);
-        rooms[code] = { name: `${from} vs ${me}`, players: [challenger.id, socket.id], private: true };
+        rooms[code] = makeRoom(`${from} vs ${me}`, [challenger.id, socket.id], true);
         challenger.join(code);
         socket.join(code);
         challenger.currentRoom = code;
@@ -569,12 +668,126 @@ io.on('connection', (socket) => {
         socket.emit('challengeMatchStart', { code, isHost: false });
         io.to(code).emit('gameStart');
 
+        broadcastRoomList(); // 친구 대결 방도 멀티플레이 목록에 표시
         broadcastPresence(from);
         broadcastPresence(me);
 
         // 두 사람이 받았거나 보낸 다른 신청은 모두 취소
         cancelChallengesFor(from, `${from}님이 다른 대결을 시작했습니다.`);
         cancelChallengesFor(me, `${me}님이 다른 대결을 시작했습니다.`);
+    });
+
+    // ===== [추가] 핑 측정 - 클라이언트가 응답 콜백을 보내면 바로 호출해 왕복 시간을 재게 함 =====
+    socket.on('pingCheck', (cb) => {
+        if (typeof cb === 'function') cb();
+    });
+
+    // ===== [추가] 친구 초대 =====
+    socket.on('inviteFriend', async (data) => {
+        const to = cleanName(data && data.to);
+        const fail = (message) => socket.emit('inviteResult', { success: false, message, to });
+        if (!socket.username) return fail('로그인이 필요합니다.');
+
+        const code = socket.currentRoom;
+        const room = code && rooms[code];
+        if (!room || room.private) return fail('방을 만든 뒤에만 초대할 수 있습니다.');
+        if (room.players[0] !== socket.id) return fail('방장만 초대할 수 있습니다.');
+        if (room.players.length >= 2) return fail('이미 상대가 들어와 있습니다.');
+
+        const from = socket.username;
+        if (!to || to === from) return fail('초대 대상이 올바르지 않습니다.');
+        const key = `${from}>${to}`;
+        if (pendingInvites.has(key)) return fail('이미 초대했습니다. 응답을 기다려주세요.');
+
+        let friendData;
+        try {
+            friendData = await getFriendData(from);
+        } catch (err) {
+            return fail('계정 서버 연결 실패');
+        }
+        if (!friendData.friends.includes(to)) return fail('친구에게만 초대할 수 있습니다.');
+
+        const target = onlineUsers.get(to);
+        if (!target) return fail(`${to}님은 오프라인입니다.`);
+        if (target.currentRoom || target.spectating) return fail(`${to}님은 게임 중이거나 방에서 대기 중입니다.`);
+
+        // 서버 응답을 기다리는 사이 방이 바뀌었는지 다시 확인
+        if (socket.currentRoom !== code || !rooms[code] || rooms[code].players.length >= 2) return fail('방 상태가 바뀌어 초대를 보내지 못했습니다.');
+        if (pendingInvites.has(key)) return fail('이미 초대했습니다. 응답을 기다려주세요.');
+
+        const timer = setTimeout(() => {
+            pendingInvites.delete(key);
+            socket.emit('inviteResult', { success: false, message: `${to}님이 응답하지 않았습니다.`, to });
+            target.emit('inviteCancelled', { from });
+        }, INVITE_TIMEOUT_MS);
+        pendingInvites.set(key, { from, to, code, timer });
+
+        target.emit('inviteReceived', { from, code, roomName: room.name, timeoutMs: INVITE_TIMEOUT_MS });
+        socket.emit('inviteSent', { to });
+    });
+
+    socket.on('inviteRespond', (data) => {
+        if (!socket.username) return;
+        const me = socket.username;
+        const from = cleanName(data && data.from);
+        const key = `${from}>${me}`;
+        const inv = pendingInvites.get(key);
+        if (!inv) {
+            socket.emit('inviteResult', { success: false, message: '만료되었거나 취소된 초대입니다.' });
+            return;
+        }
+        clearTimeout(inv.timer);
+        pendingInvites.delete(key);
+
+        const inviter = onlineUsers.get(from);
+        if (!data || !data.accept) {
+            if (inviter) inviter.emit('inviteResult', { success: false, message: `${me}님이 초대를 거절했습니다.`, to: me });
+            return;
+        }
+        const room = rooms[inv.code];
+        if (!inviter || inviter.currentRoom !== inv.code || !room || room.players.length !== 1 || room.players[0] !== inviter.id) {
+            socket.emit('inviteResult', { success: false, message: '초대받은 방이 더 이상 없습니다.' });
+            return;
+        }
+        if (socket.currentRoom || socket.spectating) {
+            socket.emit('inviteResult', { success: false, message: '이미 방에 있습니다.' });
+            if (inviter) inviter.emit('inviteResult', { success: false, message: `${me}님이 이미 다른 방에 있습니다.`, to: me });
+            return;
+        }
+        // 수락 - 받는 쪽 클라이언트가 이어서 joinRoom을 보내 입장함
+        socket.emit('inviteAccepted', { code: inv.code });
+        inviter.emit('inviteResult', { success: true, message: `${me}님이 초대를 수락했습니다.`, to: me });
+    });
+
+    // ===== [추가] 관전 =====
+    socket.on('spectateRoom', (data) => {
+        const code = cleanName(data && data.code);
+        const room = rooms[code];
+        if (!room) { socket.emit('errorMsg', '존재하지 않는 방입니다.'); return; }
+        if (room.players.length < 2) { socket.emit('errorMsg', '아직 경기가 시작되지 않은 방입니다.'); return; }
+        if (socket.currentRoom) { socket.emit('errorMsg', '방에 있는 동안에는 관전할 수 없습니다.'); return; }
+        if (socket.spectating === code) return;
+        if (room.spectators.size >= MAX_SPECTATORS) { socket.emit('errorMsg', '관전 인원이 가득 찼습니다.'); return; }
+
+        stopSpectating(socket); // 다른 방을 보고 있었다면 먼저 나감
+        room.spectators.add(socket.id);
+        socket.join(specChannel(code));
+        socket.spectating = code;
+
+        socket.emit('spectateStart', {
+            code,
+            name: room.name,
+            players: [playerNameAt(room, 0), playerNameAt(room, 1)],
+            positions: room.last,
+            weapons: room.weapon,
+            hp: room.hp,
+            score: room.score
+        });
+        broadcastRoomList();
+    });
+
+    socket.on('leaveSpectate', () => {
+        stopSpectating(socket);
     });
 
     // 1. 방 만들기
@@ -591,16 +804,14 @@ io.on('connection', (socket) => {
             return;
         }
 
+        stopSpectating(socket);
         removeFromRoom(socket); // 이전 방에 남아 있었다면 정리
 
         // 방 이름이 비어있으면 대체명 생성
         const rawName = data && typeof data.name === 'string' ? data.name.trim().slice(0, 40) : '';
         const roomName = rawName !== '' ? rawName : `매치 - ${roomCode}`;
 
-        rooms[roomCode] = {
-            name: roomName,
-            players: [socket.id]
-        };
+        rooms[roomCode] = makeRoom(roomName, [socket.id], false);
 
         socket.join(roomCode);
         socket.currentRoom = roomCode;
@@ -626,11 +837,13 @@ io.on('connection', (socket) => {
             return;
         }
 
+        stopSpectating(socket);
         removeFromRoom(socket); // 다른 방에 있었다면 먼저 나감
 
         room.players.push(socket.id);
         socket.join(roomCode);
         socket.currentRoom = roomCode;
+        cancelInvitesForRoom(roomCode); // 방이 찼으니 남은 초대는 취소
 
         broadcastRoomList();
         io.to(roomCode).emit('gameStart');
@@ -648,37 +861,87 @@ io.on('connection', (socket) => {
     // 위치 패킷은 volatile로 전달 - 받는 쪽 연결이 밀려 있으면 오래된 위치는 쌓지 않고 버림
     // (쌓아뒀다가 한꺼번에 도착하면 상대가 순간이동/되감기처럼 보이는 원인이 됨)
     socket.on('move', (data) => {
-        if (socket.currentRoom) {
-            socket.to(socket.currentRoom).volatile.emit('playerMoved', data);
+        const code = socket.currentRoom;
+        if (!code) return;
+        socket.to(code).volatile.emit('playerMoved', data);
+
+        const room = rooms[code];
+        const idx = room ? room.players.indexOf(socket.id) : -1;
+        if (idx >= 0 && data) {
+            const pos = { x: data.x, y: data.y, z: data.z, yaw: data.yaw };
+            room.last[idx] = pos;
+            specEmit(code, room, 'specMove', { i: idx, x: pos.x, y: pos.y, z: pos.z, yaw: pos.yaw }, true);
         }
     });
 
     socket.on('weaponChange', (data) => {
-        if (socket.currentRoom) {
-            socket.to(socket.currentRoom).emit('enemyWeaponChanged', data);
+        const code = socket.currentRoom;
+        if (!code) return;
+        socket.to(code).emit('enemyWeaponChanged', data);
+
+        const room = rooms[code];
+        const idx = room ? room.players.indexOf(socket.id) : -1;
+        if (idx >= 0 && data) {
+            room.weapon[idx] = data.weapon;
+            specEmit(code, room, 'specWeapon', { i: idx, weapon: data.weapon });
         }
     });
 
     socket.on('enemyShoot', (data) => {
-        if (socket.currentRoom) {
-            socket.to(socket.currentRoom).emit('enemyFired', data);
-        }
+        const code = socket.currentRoom;
+        if (!code) return;
+        socket.to(code).emit('enemyFired', data);
+
+        const room = rooms[code];
+        const idx = room ? room.players.indexOf(socket.id) : -1;
+        if (idx >= 0) specEmit(code, room, 'specFire', { i: idx, weapon: data && data.weapon, mode: data && data.mode });
     });
 
     socket.on('hit', (data) => {
-        if (socket.currentRoom) {
-            socket.to(socket.currentRoom).emit('takeDamage', data);
+        const code = socket.currentRoom;
+        if (!code) return;
+        socket.to(code).emit('takeDamage', data);
+
+        // 관전자용 체력 추적 (실제 판정은 기존처럼 각 클라이언트가 함)
+        const room = rooms[code];
+        const idx = room ? room.players.indexOf(socket.id) : -1;
+        if (idx >= 0) {
+            const victim = 1 - idx;
+            const dmg = Math.max(0, Math.min(100, Number(data && data.damage) || 0));
+            room.hp[victim] = Math.max(0, room.hp[victim] - dmg);
+            specEmit(code, room, 'specHp', { i: victim, hp: room.hp[victim] });
         }
     });
 
     socket.on('iDied', () => {
-        if (socket.currentRoom) {
-            socket.to(socket.currentRoom).emit('enemyKilled');
+        const code = socket.currentRoom;
+        if (!code) return;
+        socket.to(code).emit('enemyKilled');
+
+        const room = rooms[code];
+        const idx = room ? room.players.indexOf(socket.id) : -1;
+        if (idx >= 0) {
+            const winner = 1 - idx;
+            room.hp[idx] = 0;
+            room.score[winner] += 1;
+            specEmit(code, room, 'specDeath', { i: idx, score: room.score });
+            clearTimeout(room.resetTimer);
+            if (room.score[winner] >= 5) {
+                specEmit(code, room, 'specMatchEnd', { winner, score: room.score });
+            } else {
+                // 라운드가 다시 시작되는 시점(클라이언트가 약 1.5초 뒤 시작)에 체력을 되돌림
+                room.resetTimer = setTimeout(() => {
+                    if (rooms[code] !== room) return;
+                    room.hp = [100, 100];
+                    specEmit(code, room, 'specRound', { hp: room.hp });
+                }, 1600);
+            }
         }
     });
 
     // 접속 해제 처리
     socket.on('disconnect', () => {
+        stopSpectating(socket);
         clearUserSession(socket);
         removeFromRoom(socket);
     });
