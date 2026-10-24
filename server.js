@@ -20,7 +20,7 @@ process.on('uncaughtException', (e) => console.error('[uncaughtException]', e));
 // 구글 앱스크립트(Code.gs)를 웹앱으로 배포한 뒤 나오는 URL로 반드시 교체하세요.
 const ACCOUNT_API_URL = 'https://script.google.com/macros/s/AKfycby7gNM97v9keZ-Y7MUnrtvtA2SZD7fOeBzH1wsx-dd3F08rPM-_WZm44zt_ayDTUFfAkA/exec';
 // 클라이언트가 이 버전이 아니면 "업데이트가 필요합니다" 안내를 보냄
-const REQUIRED_VERSION = 'Beta 1.3';
+const REQUIRED_VERSION = 'Beta 1.4';
 
 const API_TIMEOUT_MS = 20 * 1000;                                  // 앱스크립트가 처음 깰 때 느릴 수 있어 넉넉하게
 const READ_ACTIONS = new Set(['getFriends', 'getQuizzes', 'getSettings']); // 실패 시 한 번 더 시도해도 안전한 읽기 요청
@@ -259,30 +259,78 @@ function cleanName(v) {
     return String(v == null ? '' : v).trim().slice(0, 40);
 }
 
-// [수정] 친구 대결 방(private)도 목록에 포함 - 이미 2명이 있어서 참가는 못 하지만 관전할 수 있음
+// ===== 방 / 팀전 설정 =====
+const TEAM_MAX = 5;     // 팀전은 한 팀당 최대 5명
+const WIN_SCORE = 5;    // 먼저 5라운드를 이기면 승리
+
+const sockById = (id) => io.sockets.sockets.get(id);
+function nameOf(sock) { return (sock && (sock.username || sock.guestName)) || '손님'; }
+function nameOfId(id) { return nameOf(sockById(id)); }
+
+// 친구 대결 방(private)도 목록에 포함 - 이미 2명이 있어서 참가는 못 하지만 관전할 수 있음. 비공개(hidden) 방은 목록에서 숨김
 function getPublicRoomList() {
-    return Object.keys(rooms).map(code => ({
+    return Object.keys(rooms).filter(code => !rooms[code].hidden).map(code => ({
         code: code,
         name: rooms[code].name,
         count: rooms[code].players.length,
+        max: rooms[code].mode === 'team' ? TEAM_MAX * 2 : 2,
+        mode: rooms[code].mode,
+        started: !!rooms[code].started,
         friend: !!rooms[code].private,
         spectators: rooms[code].spectators.size
     }));
 }
 
-// [추가] 방 객체 생성 - 관전자/관전용 상태(마지막 위치, 무기, 체력, 점수)를 함께 보관
-function makeRoom(name, players, isPrivate) {
+// 방 객체 생성 - 관전자/관전용 상태(마지막 위치, 무기, 체력, 점수)를 함께 보관
+// opts.mode: '1v1' | 'team',  opts.hidden: 비공개 방(목록에 안 보임)
+function makeRoom(name, players, isPrivate, opts) {
+    opts = opts || {};
     return {
         name,
         players,
-        private: !!isPrivate,
+        host: players[0] || null,
+        mode: opts.mode === 'team' ? 'team' : '1v1',
+        hidden: !!opts.hidden,
+        private: !!isPrivate,      // 친구 대결 신청으로 만들어진 방
+        started: !!isPrivate,      // 친구 대결 방은 만들어지는 즉시 시작됨
+        teamOf: {},                // (팀전) 소켓 id -> 0 | 1
+        slotOf: {}, idOfSlot: [], teamOfSlot: [], nameOfSlot: [], idxOfSlot: [], connected: [], alive: [], n: 2,
+        roundEnded: false, matchOver: false, roundTimer: null,
         spectators: new Set(),     // 관전 중인 소켓 id
-        last: [null, null],        // 두 플레이어의 마지막 위치 (늦게 들어온 관전자에게 바로 보여주기 위함)
+        last: [null, null],        // 플레이어(슬롯)별 마지막 위치 (늦게 들어온 관전자에게 바로 보여주기 위함)
         weapon: [1, 1],
         hp: [100, 100],
         score: [0, 0],
         resetTimer: null
     };
+}
+
+// 방에 더 들어올 자리가 있는지 (시작 전이고 정원 미만)
+function roomHasSpace(room) {
+    if (!room || room.started) return false;
+    return room.mode === 'team' ? room.players.length < TEAM_MAX * 2 : room.players.length < 2;
+}
+
+// 소켓이 방 안에서 몇 번째 플레이어(슬롯)인지 - 팀전은 시작할 때 정해진 번호, 1대1은 입장 순서
+function slotOfSocket(room, socket) {
+    const s = room.slotOf[socket.id];
+    return s !== undefined ? s : room.players.indexOf(socket.id);
+}
+
+// (팀전) 방 대기실 상태를 방 안 모두에게 보냄
+function emitRoomState(code) {
+    const room = rooms[code];
+    if (!room || room.mode !== 'team') return;
+    io.to(code).emit('roomState', {
+        code,
+        name: room.name,
+        mode: room.mode,
+        hidden: room.hidden,
+        started: room.started,
+        host: room.host,
+        max: TEAM_MAX,
+        players: room.players.map(id => ({ id, name: nameOfId(id), team: room.teamOf[id] === 1 ? 1 : 0, host: id === room.host }))
+    });
 }
 
 function broadcastRoomList() {
@@ -301,6 +349,7 @@ function specEmit(code, room, event, payload, volatile) {
 }
 
 function playerNameAt(room, i) {
+    if (room.mode === 'team') return room.nameOfSlot[i] || `플레이어 ${i + 1}`;
     const s = io.sockets.sockets.get(room.players[i]);
     return (s && s.username) ? s.username : `플레이어 ${i + 1}`;
 }
@@ -366,8 +415,69 @@ function cancelInvitesForRoom(code) {
     }
 }
 
+// ===== (팀전) 라운드 / 경기 진행 - 서버가 판정함 =====
+// 한 팀이 전멸하면 상대 팀이 라운드 승리. 먼저 WIN_SCORE 라운드를 이기면 경기 종료
+function checkTeamRound(code, room) {
+    if (!room.started || room.roundEnded || room.matchOver) return;
+    const aliveCnt = [0, 0];
+    for (let sl = 0; sl < room.n; sl++) if (room.alive[sl]) aliveCnt[room.teamOfSlot[sl]]++;
+    if (aliveCnt[0] > 0 && aliveCnt[1] > 0) return;
+
+    room.roundEnded = true;
+    const winner = aliveCnt[0] > 0 ? 0 : (aliveCnt[1] > 0 ? 1 : -1); // 둘 다 0명이면 무승부(점수 없음)
+    if (winner >= 0) room.score[winner] += 1;
+    io.to(code).emit('teamRoundEnd', { winner, scores: room.score });
+    specEmit(code, room, 'specTeamRound', { winner, score: room.score });
+
+    clearTimeout(room.roundTimer);
+    if (winner >= 0 && room.score[winner] >= WIN_SCORE) {
+        endTeamMatch(code, room, winner, false);
+    } else {
+        room.roundTimer = setTimeout(() => startTeamRound(code, room), 1600);
+    }
+}
+
+function startTeamRound(code, room) {
+    if (rooms[code] !== room || !room.started || room.matchOver) return;
+    room.roundEnded = false;
+    for (let sl = 0; sl < room.n; sl++) {
+        room.alive[sl] = !!room.connected[sl];
+        room.hp[sl] = room.connected[sl] ? 100 : 0;
+    }
+    io.to(code).emit('teamRoundStart', { scores: room.score });
+    specEmit(code, room, 'specRound', { hp: room.hp });
+}
+
+function endTeamMatch(code, room, winner, forfeit) {
+    if (room.matchOver) return;
+    room.matchOver = true;
+    room.roundEnded = true;
+    io.to(code).emit('teamMatchEnd', { winner, scores: room.score, forfeit: !!forfeit });
+    specEmit(code, room, 'specMatchEnd', { winner, score: room.score });
+    clearTimeout(room.roundTimer);
+    room.roundTimer = setTimeout(() => teamBackToLobby(code, room), 5000);
+}
+
+// 경기가 끝나면 같은 방 대기실로 돌아가 팀을 유지한 채 다시 할 수 있음
+function teamBackToLobby(code, room) {
+    if (rooms[code] !== room) return;
+    clearTimeout(room.roundTimer);
+    room.started = false;
+    room.matchOver = false;
+    room.roundEnded = false;
+    room.score = [0, 0];
+    room.slotOf = {}; room.idOfSlot = []; room.teamOfSlot = []; room.nameOfSlot = []; room.idxOfSlot = [];
+    room.connected = []; room.alive = []; room.n = 2;
+    room.last = [null, null]; room.weapon = [1, 1]; room.hp = [100, 100];
+    endRoomSpectators(code, room, '경기가 끝났습니다.');
+    io.to(code).emit('teamBackToLobby');
+    emitRoomState(code);
+    broadcastRoomList();
+}
+
 // 소켓을 현재 방에서 빼는 공통 처리 (방 나가기 / 접속 종료 / 다른 방으로 이동할 때 공용)
-// 남은 인원이 없으면 방 삭제, 있으면 상대에게 playerLeft 알림. 관전자는 경기가 끝났으므로 내보냄
+// 1대1: 남은 인원이 없으면 방 삭제, 있으면 상대에게 playerLeft 알림. 관전자는 경기가 끝났으므로 내보냄
+// 팀전: 방장이 나가면 다음 사람이 방장, 진행 중이면 그 사람은 탈락 처리(한 팀이 전부 나가면 상대 팀 승리)
 function removeFromRoom(socket) {
     const code = socket.currentRoom;
     if (!code) return false;
@@ -376,10 +486,43 @@ function removeFromRoom(socket) {
     if (!room) return true;
 
     socket.leave(code);
+    const slot = room.slotOf[socket.id];
     room.players = room.players.filter(id => id !== socket.id);
+    delete room.teamOf[socket.id];
+    clearTimeout(room.resetTimer);
+
+    if (room.mode === 'team') {
+        if (room.players.length === 0) {
+            clearTimeout(room.roundTimer);
+            cancelInvitesForRoom(code);
+            endRoomSpectators(code, room, '방이 사라졌습니다.');
+            delete rooms[code];
+        } else {
+            const hostChanged = room.host === socket.id;
+            if (hostChanged) room.host = room.players[0];
+            if (room.started && slot !== undefined) {
+                room.connected[slot] = false;
+                room.alive[slot] = false;
+                room.hp[slot] = 0;
+                io.to(code).emit('teamPlayerLeft', { slot });
+                specEmit(code, room, 'specLeft', { i: slot });
+                const conn = [0, 0];
+                for (let sl = 0; sl < room.n; sl++) if (room.connected[sl]) conn[room.teamOfSlot[sl]]++;
+                if (!room.matchOver) {
+                    if (conn[0] === 0 || conn[1] === 0) endTeamMatch(code, room, conn[0] === 0 ? 1 : 0, true);
+                    else checkTeamRound(code, room);
+                }
+            } else if (hostChanged) {
+                cancelInvitesForRoom(code); // 대기실에서 방장이 바뀌면 이전 방장이 보낸 초대는 취소
+            }
+            emitRoomState(code);
+        }
+        broadcastRoomList();
+        return true;
+    }
+
     cancelInvitesForRoom(code);
     endRoomSpectators(code, room, '플레이어가 나가서 경기가 끝났습니다.');
-    clearTimeout(room.resetTimer);
     if (room.players.length === 0) delete rooms[code];
     else io.to(code).emit('playerLeft');
 
@@ -388,6 +531,7 @@ function removeFromRoom(socket) {
 }
 
 io.on('connection', (socket) => {
+    socket.guestName = '손님' + Math.floor(100 + Math.random() * 900); // 로그인하지 않은 사람의 방 안 표시 이름
     // 연결 시 현재 방 목록 전송
     socket.emit('updateRoomList', getPublicRoomList());
 
@@ -670,7 +814,7 @@ io.on('connection', (socket) => {
         // 친구 전용 비공개 방을 만들어 두 사람을 바로 입장시킴 (방 목록에는 보이지 않음)
         let code;
         do { code = 'f' + Math.random().toString(36).slice(2, 8); } while (rooms[code]);
-        rooms[code] = makeRoom(`${from} vs ${me}`, [challenger.id, socket.id], true);
+        rooms[code] = makeRoom(`${from} vs ${me}`, [challenger.id, socket.id], true, { mode: '1v1' });
         challenger.join(code);
         socket.join(code);
         challenger.currentRoom = code;
@@ -703,8 +847,8 @@ io.on('connection', (socket) => {
         const code = socket.currentRoom;
         const room = code && rooms[code];
         if (!room || room.private) return fail('방을 만든 뒤에만 초대할 수 있습니다.');
-        if (room.players[0] !== socket.id) return fail('방장만 초대할 수 있습니다.');
-        if (room.players.length >= 2) return fail('이미 상대가 들어와 있습니다.');
+        if (room.host !== socket.id) return fail('방장만 초대할 수 있습니다.');
+        if (!roomHasSpace(room)) return fail(room.started ? '이미 게임이 시작되었습니다.' : '방이 가득 찼습니다.');
 
         const from = socket.username;
         if (!to || to === from) return fail('초대 대상이 올바르지 않습니다.');
@@ -724,7 +868,7 @@ io.on('connection', (socket) => {
         if (target.currentRoom || target.spectating) return fail(`${to}님은 게임 중이거나 방에서 대기 중입니다.`);
 
         // 서버 응답을 기다리는 사이 방이 바뀌었는지 다시 확인
-        if (socket.currentRoom !== code || !rooms[code] || rooms[code].players.length >= 2) return fail('방 상태가 바뀌어 초대를 보내지 못했습니다.');
+        if (socket.currentRoom !== code || !rooms[code] || !roomHasSpace(rooms[code])) return fail('방 상태가 바뀌어 초대를 보내지 못했습니다.');
         if (pendingInvites.has(key)) return fail('이미 초대했습니다. 응답을 기다려주세요.');
 
         const timer = setTimeout(() => {
@@ -757,7 +901,7 @@ io.on('connection', (socket) => {
             return;
         }
         const room = rooms[inv.code];
-        if (!inviter || inviter.currentRoom !== inv.code || !room || room.players.length !== 1 || room.players[0] !== inviter.id) {
+        if (!inviter || inviter.currentRoom !== inv.code || !room || !roomHasSpace(room) || room.host !== inviter.id) {
             socket.emit('inviteResult', { success: false, message: '초대받은 방이 더 이상 없습니다.' });
             return;
         }
@@ -776,7 +920,7 @@ io.on('connection', (socket) => {
         const code = cleanName(data && data.code);
         const room = rooms[code];
         if (!room) { socket.emit('errorMsg', '존재하지 않는 방입니다.'); return; }
-        if (room.players.length < 2) { socket.emit('errorMsg', '아직 경기가 시작되지 않은 방입니다.'); return; }
+        if (!room.started || (room.mode !== 'team' && room.players.length < 2)) { socket.emit('errorMsg', '아직 경기가 시작되지 않은 방입니다.'); return; }
         if (socket.currentRoom) { socket.emit('errorMsg', '방에 있는 동안에는 관전할 수 없습니다.'); return; }
         if (socket.spectating === code) return;
         if (room.spectators.size >= MAX_SPECTATORS) { socket.emit('errorMsg', '관전 인원이 가득 찼습니다.'); return; }
@@ -789,7 +933,9 @@ io.on('connection', (socket) => {
         socket.emit('spectateStart', {
             code,
             name: room.name,
-            players: [playerNameAt(room, 0), playerNameAt(room, 1)],
+            mode: room.mode,
+            players: room.mode === 'team' ? room.nameOfSlot.slice() : [playerNameAt(room, 0), playerNameAt(room, 1)],
+            teams: room.mode === 'team' ? room.teamOfSlot.slice() : [0, 1],
             positions: room.last,
             weapons: room.weapon,
             hp: room.hp,
@@ -802,14 +948,14 @@ io.on('connection', (socket) => {
         stopSpectating(socket);
     });
 
-    // 1. 방 만들기
+    // 1. 방 만들기 (mode: '1v1' | 'team', hidden: 비공개 방)
     socket.on('createRoom', (data) => {
         const roomCode = cleanName(data && data.code);
         if (!roomCode) {
             socket.emit('errorMsg', '방 코드가 올바르지 않습니다.');
             return;
         }
-        // [수정] 같은 코드의 방이 이미 있으면 덮어쓰지 않음 (같은 요청이 두 번 들어온 경우는 무시)
+        // 같은 코드의 방이 이미 있으면 덮어쓰지 않음 (같은 요청이 두 번 들어온 경우는 무시)
         if (rooms[roomCode]) {
             if (rooms[roomCode].players.includes(socket.id)) return;
             socket.emit('errorMsg', '이미 존재하는 방 코드입니다. 다시 시도해주세요.');
@@ -822,11 +968,14 @@ io.on('connection', (socket) => {
         // 방 이름이 비어있으면 대체명 생성
         const rawName = data && typeof data.name === 'string' ? data.name.trim().slice(0, 40) : '';
         const roomName = rawName !== '' ? rawName : `매치 - ${roomCode}`;
+        const mode = data && data.mode === 'team' ? 'team' : '1v1';
 
-        rooms[roomCode] = makeRoom(roomName, [socket.id], false);
+        rooms[roomCode] = makeRoom(roomName, [socket.id], false, { mode, hidden: !!(data && data.hidden) });
+        if (mode === 'team') rooms[roomCode].teamOf[socket.id] = 0; // 방장은 A팀에서 시작
 
         socket.join(roomCode);
         socket.currentRoom = roomCode;
+        emitRoomState(roomCode);
         broadcastRoomList();
         broadcastPresence(socket.username);
     });
@@ -841,10 +990,14 @@ io.on('connection', (socket) => {
             return;
         }
 
-        // [수정] 자기 방에 다시 들어가 혼자 게임이 시작되는 문제 방지
+        // 자기 방에 다시 들어가 혼자 게임이 시작되는 문제 방지
         if (room.players.includes(socket.id)) return;
 
-        if (room.players.length >= 2) {
+        if (room.started) {
+            socket.emit('errorMsg', '이미 게임이 시작된 방입니다. 목록에서 관전할 수 있습니다.');
+            return;
+        }
+        if (!roomHasSpace(room)) {
             socket.emit('errorMsg', '방이 이미 가득 찼습니다.');
             return;
         }
@@ -855,11 +1008,91 @@ io.on('connection', (socket) => {
         room.players.push(socket.id);
         socket.join(roomCode);
         socket.currentRoom = roomCode;
-        cancelInvitesForRoom(roomCode); // 방이 찼으니 남은 초대는 취소
 
+        if (room.mode === 'team') {
+            // 사람이 적은 팀으로 자동 배정 (방장이 나중에 옮길 수 있음)
+            const cnt = [0, 0];
+            room.players.forEach(id => { if (id !== socket.id) cnt[room.teamOf[id] === 1 ? 1 : 0]++; });
+            room.teamOf[socket.id] = cnt[0] <= cnt[1] ? 0 : 1;
+            if (!roomHasSpace(room)) cancelInvitesForRoom(roomCode);
+            emitRoomState(roomCode);
+            broadcastRoomList();
+            broadcastPresence(socket.username);
+            return;
+        }
+
+        room.started = true;
+        cancelInvitesForRoom(roomCode); // 방이 찼으니 남은 초대는 취소
         broadcastRoomList();
         io.to(roomCode).emit('gameStart');
         broadcastPresence(socket.username);
+    });
+
+    // ===== [추가] 방 옵션 (방장): 공개 / 비공개 =====
+    socket.on('roomOption', (data) => {
+        const code = socket.currentRoom;
+        const room = code && rooms[code];
+        if (!room || room.private || room.started || room.host !== socket.id) return;
+        room.hidden = !!(data && data.hidden);
+        emitRoomState(code);
+        broadcastRoomList();
+    });
+
+    // ===== [추가] 팀전 대기실: 방장이 플레이어를 다른 팀으로 옮김 =====
+    socket.on('teamMove', (data) => {
+        const code = socket.currentRoom;
+        const room = code && rooms[code];
+        if (!room || room.mode !== 'team' || room.started) return;
+        if (room.host !== socket.id) { socket.emit('errorMsg', '방장만 팀을 옮길 수 있습니다.'); return; }
+        const id = String(data && data.id);
+        if (!room.players.includes(id)) return;
+        const team = data && data.team === 1 ? 1 : 0;
+        const inTeam = room.players.filter(p => p !== id && room.teamOf[p] === team).length;
+        if (inTeam >= TEAM_MAX) { socket.emit('errorMsg', `한 팀은 최대 ${TEAM_MAX}명입니다.`); return; }
+        room.teamOf[id] = team;
+        emitRoomState(code);
+    });
+
+    // ===== [추가] 팀전 시작 (방장만) =====
+    socket.on('startTeamGame', () => {
+        const code = socket.currentRoom;
+        const room = code && rooms[code];
+        if (!room || room.mode !== 'team' || room.started) return;
+        if (room.host !== socket.id) { socket.emit('errorMsg', '방장만 게임을 시작할 수 있습니다.'); return; }
+
+        const t0 = room.players.filter(id => room.teamOf[id] !== 1);
+        const t1 = room.players.filter(id => room.teamOf[id] === 1);
+        if (t0.length === 0 || t1.length === 0) { socket.emit('errorMsg', '양 팀에 최소 1명씩 있어야 시작할 수 있습니다.'); return; }
+
+        // 시작할 때 모든 플레이어에게 고정 번호(슬롯)를 줌 - 이후 위치/발사/피격 이벤트가 이 번호로 오감
+        room.slotOf = {}; room.idOfSlot = []; room.teamOfSlot = []; room.nameOfSlot = []; room.idxOfSlot = [];
+        [[t0, 0], [t1, 1]].forEach(([list, team]) => list.forEach((id, idx) => {
+            const slot = room.idOfSlot.length;
+            room.slotOf[id] = slot;
+            room.idOfSlot.push(id);
+            room.teamOfSlot.push(team);
+            room.nameOfSlot.push(nameOfId(id));
+            room.idxOfSlot.push(idx);
+        }));
+        room.n = room.idOfSlot.length;
+        room.alive = Array(room.n).fill(true);
+        room.connected = Array(room.n).fill(true);
+        room.hp = Array(room.n).fill(100);
+        room.weapon = Array(room.n).fill(1);
+        room.last = Array(room.n).fill(null);
+        room.score = [0, 0];
+        room.started = true;
+        room.matchOver = false;
+        room.roundEnded = false;
+        clearTimeout(room.roundTimer);
+        cancelInvitesForRoom(code);
+
+        const roster = room.idOfSlot.map((id, slot) => ({ slot, name: room.nameOfSlot[slot], team: room.teamOfSlot[slot], idx: room.idxOfSlot[slot] }));
+        room.idOfSlot.forEach((id, slot) => {
+            io.to(id).emit('teamGameStart', { players: roster, you: { slot, team: room.teamOfSlot[slot] } });
+        });
+        emitRoomState(code);
+        broadcastRoomList();
     });
 
     // 3. 방 나가기 및 취소 (유령 방 방지)
@@ -874,73 +1107,98 @@ io.on('connection', (socket) => {
     // (쌓아뒀다가 한꺼번에 도착하면 상대가 순간이동/되감기처럼 보이는 원인이 됨)
     socket.on('move', (data) => {
         const code = socket.currentRoom;
-        if (!code) return;
-        socket.to(code).volatile.emit('playerMoved', data);
+        const room = code && rooms[code];
+        if (!room) return;
+        const slot = slotOfSocket(room, socket);
+        if (room.mode === 'team' && (!room.started || !room.alive[slot])) return; // 대기실이거나 이미 죽은 사람의 위치는 무시
+        socket.to(code).volatile.emit('playerMoved', Object.assign({}, data, { pid: slot }));
 
-        const room = rooms[code];
-        const idx = room ? room.players.indexOf(socket.id) : -1;
-        if (idx >= 0 && data) {
+        if (slot >= 0 && data) {
             // 관전자가 1인칭으로 볼 수 있도록 시선 위아래(pitch)도 함께 전달 (숫자로 보정)
             const num = (v) => (Number.isFinite(Number(v)) ? Number(v) : 0);
             const pos = { x: num(data.x), y: num(data.y), z: num(data.z), yaw: num(data.yaw), pitch: Math.max(-1.6, Math.min(1.6, num(data.pitch))) };
-            room.last[idx] = pos;
-            specEmit(code, room, 'specMove', { i: idx, x: pos.x, y: pos.y, z: pos.z, yaw: pos.yaw, pitch: pos.pitch }, true);
+            room.last[slot] = pos;
+            specEmit(code, room, 'specMove', { i: slot, x: pos.x, y: pos.y, z: pos.z, yaw: pos.yaw, pitch: pos.pitch }, true);
         }
     });
 
     socket.on('weaponChange', (data) => {
         const code = socket.currentRoom;
-        if (!code) return;
-        socket.to(code).emit('enemyWeaponChanged', data);
-
-        const room = rooms[code];
-        const idx = room ? room.players.indexOf(socket.id) : -1;
-        if (idx >= 0 && data) {
-            room.weapon[idx] = data.weapon;
-            specEmit(code, room, 'specWeapon', { i: idx, weapon: data.weapon });
+        const room = code && rooms[code];
+        if (!room) return;
+        const slot = slotOfSocket(room, socket);
+        if (room.mode === 'team' && !room.started) return;
+        socket.to(code).emit('enemyWeaponChanged', Object.assign({}, data, { pid: slot }));
+        if (slot >= 0 && data) {
+            room.weapon[slot] = data.weapon;
+            specEmit(code, room, 'specWeapon', { i: slot, weapon: data.weapon });
         }
     });
 
     socket.on('enemyShoot', (data) => {
         const code = socket.currentRoom;
-        if (!code) return;
-        socket.to(code).emit('enemyFired', data);
-
-        const room = rooms[code];
-        const idx = room ? room.players.indexOf(socket.id) : -1;
-        if (idx >= 0) specEmit(code, room, 'specFire', { i: idx, weapon: data && data.weapon, mode: data && data.mode });
+        const room = code && rooms[code];
+        if (!room) return;
+        const slot = slotOfSocket(room, socket);
+        if (room.mode === 'team' && (!room.started || !room.alive[slot])) return;
+        socket.to(code).emit('enemyFired', Object.assign({}, data, { pid: slot }));
+        if (slot >= 0) specEmit(code, room, 'specFire', { i: slot, weapon: data && data.weapon, mode: data && data.mode });
     });
 
     socket.on('hit', (data) => {
         const code = socket.currentRoom;
-        if (!code) return;
-        socket.to(code).emit('takeDamage', data);
+        const room = code && rooms[code];
+        if (!room) return;
+        const slot = slotOfSocket(room, socket);
+        const dmg = Math.max(0, Math.min(100, Number(data && data.damage) || 0));
 
+        if (room.mode === 'team') {
+            // 팀전: 맞은 사람에게만 데미지를 전달. 같은 팀/이미 죽은 사람은 무시
+            if (!room.started || room.matchOver || !room.alive[slot]) return;
+            const tSlot = Number(data && data.target);
+            if (!Number.isInteger(tSlot) || tSlot < 0 || tSlot >= room.n || !room.alive[tSlot]) return;
+            if (room.teamOfSlot[tSlot] === room.teamOfSlot[slot]) return;
+            io.to(room.idOfSlot[tSlot]).emit('takeDamage', { damage: dmg, from: slot });
+            room.hp[tSlot] = Math.max(0, room.hp[tSlot] - dmg);
+            specEmit(code, room, 'specHp', { i: tSlot, hp: room.hp[tSlot] });
+            return;
+        }
+
+        socket.to(code).emit('takeDamage', data);
         // 관전자용 체력 추적 (실제 판정은 기존처럼 각 클라이언트가 함)
-        const room = rooms[code];
-        const idx = room ? room.players.indexOf(socket.id) : -1;
-        if (idx >= 0) {
-            const victim = 1 - idx;
-            const dmg = Math.max(0, Math.min(100, Number(data && data.damage) || 0));
+        if (slot >= 0) {
+            const victim = 1 - slot;
             room.hp[victim] = Math.max(0, room.hp[victim] - dmg);
             specEmit(code, room, 'specHp', { i: victim, hp: room.hp[victim] });
         }
     });
 
-    socket.on('iDied', () => {
+    socket.on('iDied', (data) => {
         const code = socket.currentRoom;
-        if (!code) return;
-        socket.to(code).emit('enemyKilled');
+        const room = code && rooms[code];
+        if (!room) return;
+        const slot = slotOfSocket(room, socket);
 
-        const room = rooms[code];
-        const idx = room ? room.players.indexOf(socket.id) : -1;
-        if (idx >= 0) {
-            const winner = 1 - idx;
-            room.hp[idx] = 0;
+        if (room.mode === 'team') {
+            if (!room.started || room.matchOver || !room.alive[slot]) return;
+            room.alive[slot] = false;
+            room.hp[slot] = 0;
+            let killer = Number(data && data.killer);
+            if (!Number.isInteger(killer) || killer < 0 || killer >= room.n || room.teamOfSlot[killer] === room.teamOfSlot[slot]) killer = -1;
+            io.to(code).emit('playerDied', { slot, killer });
+            specEmit(code, room, 'specDeath', { i: slot, killer, score: room.score });
+            checkTeamRound(code, room);
+            return;
+        }
+
+        socket.to(code).emit('enemyKilled');
+        if (slot >= 0) {
+            const winner = 1 - slot;
+            room.hp[slot] = 0;
             room.score[winner] += 1;
-            specEmit(code, room, 'specDeath', { i: idx, score: room.score });
+            specEmit(code, room, 'specDeath', { i: slot, score: room.score });
             clearTimeout(room.resetTimer);
-            if (room.score[winner] >= 5) {
+            if (room.score[winner] >= WIN_SCORE) {
                 specEmit(code, room, 'specMatchEnd', { winner, score: room.score });
             } else {
                 // 라운드가 다시 시작되는 시점(클라이언트가 약 1.5초 뒤 시작)에 체력을 되돌림
