@@ -1087,9 +1087,16 @@ io.on('connection', (socket) => {
         clearTimeout(room.roundTimer);
         cancelInvitesForRoom(code);
 
-        const roster = room.idOfSlot.map((id, slot) => ({ slot, name: room.nameOfSlot[slot], team: room.teamOfSlot[slot], idx: room.idxOfSlot[slot] }));
+        // 게임 중에는 상대 팀 닉네임이 보이지 않도록, 받는 사람마다 상대 팀 이름을 "적 N"으로 바꿔서 보냄
         room.idOfSlot.forEach((id, slot) => {
-            io.to(id).emit('teamGameStart', { players: roster, you: { slot, team: room.teamOfSlot[slot] } });
+            const myTeam = room.teamOfSlot[slot];
+            const roster = room.idOfSlot.map((_, sl) => ({
+                slot: sl,
+                name: room.teamOfSlot[sl] === myTeam ? room.nameOfSlot[sl] : `적 ${room.idxOfSlot[sl] + 1}`,
+                team: room.teamOfSlot[sl],
+                idx: room.idxOfSlot[sl]
+            }));
+            io.to(id).emit('teamGameStart', { players: roster, you: { slot, team: myTeam } });
         });
         emitRoomState(code);
         broadcastRoomList();
