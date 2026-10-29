@@ -8,11 +8,11 @@ const io = new Server(server, {
     cors: { origin: "*", methods: ["GET", "POST"] }
 });
 
-// [추가] 상태 확인용 주소 - Render 헬스체크나 외부 핑(UptimeRobot 등)으로 서버를 깨워둘 때 사용
+// 상태 확인용 주소 - Render 헬스체크나 외부 핑(UptimeRobot 등)으로 서버를 깨워둘 때 사용
 app.get('/', (req, res) => res.send('ok'));
 app.get('/health', (req, res) => res.json({ ok: true, uptime: Math.round(process.uptime()), online: onlineUsers.size, rooms: Object.keys(rooms).length }));
 
-// [추가] 처리하지 못한 오류 하나 때문에 서버 전체가 꺼지지 않도록 기록만 남김
+// 처리하지 못한 오류 하나 때문에 서버 전체가 꺼지지 않도록 기록만 남김
 process.on('unhandledRejection', (e) => console.error('[unhandledRejection]', e));
 process.on('uncaughtException', (e) => console.error('[uncaughtException]', e));
 
@@ -20,10 +20,10 @@ process.on('uncaughtException', (e) => console.error('[uncaughtException]', e));
 // 구글 앱스크립트(Code.gs)를 웹앱으로 배포한 뒤 나오는 URL로 반드시 교체하세요.
 const ACCOUNT_API_URL = 'https://script.google.com/macros/s/AKfycby7gNM97v9keZ-Y7MUnrtvtA2SZD7fOeBzH1wsx-dd3F08rPM-_WZm44zt_ayDTUFfAkA/exec';
 // 클라이언트가 이 버전이 아니면 "업데이트가 필요합니다" 안내를 보냄
-const REQUIRED_VERSION = 'Beta 1.5';
+const REQUIRED_VERSION = 'Beta 1.6';
 
-const API_TIMEOUT_MS = 20 * 1000;                                  // 앱스크립트가 처음 깰 때 느릴 수 있어 넉넉하게
-const READ_ACTIONS = new Set(['getFriends', 'getQuizzes', 'getSettings']); // 실패 시 한 번 더 시도해도 안전한 읽기 요청
+const API_TIMEOUT_MS = 20 * 1000;                                              // 앱스크립트가 처음 깰 때 느릴 수 있어 넉넉하게
+const READ_ACTIONS = new Set(['getFriends', 'getQuizzes', 'getSettings', 'getRanked']); // 실패 시 한 번 더 시도해도 안전한 읽기 요청
 
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
@@ -51,7 +51,7 @@ async function callAccountApiOnce(payload) {
     }
 }
 
-// [수정] 읽기 요청은 실패하면 한 번 더 시도 (쓰기 요청은 중복 실행을 막기 위해 재시도하지 않음)
+// 읽기 요청은 실패하면 한 번 더 시도 (쓰기 요청은 중복 실행을 막기 위해 재시도하지 않음)
 async function callAccountApi(payload) {
     const retries = READ_ACTIONS.has(payload.action) ? 1 : 0;
     for (let attempt = 0; ; attempt++) {
@@ -97,7 +97,7 @@ function clearAdminFail(ip) {
 }
 const LOCKED_RESULT = { success: false, message: '시도 횟수가 너무 많습니다. 1분 후 다시 시도하세요.' };
 
-// ===== [추가] 퀴즈 캐시 =====
+// ===== 퀴즈 캐시 =====
 // 모든 접속자가 퀴즈를 요청할 때마다 앱스크립트를 부르지 않고, 서버 메모리에 보관해 바로 돌려줌.
 // 오래되면(10분) 일단 보관본을 보내면서 뒤에서 새로 받아옴. 저장(saveQuizzes) 성공 시 바로 무효화.
 const QUIZ_TTL_MS = 10 * 60 * 1000;
@@ -141,7 +141,15 @@ const onlineUsers = new Map();       // 아이디 -> 소켓 (로그인한 사람
 const pendingChallenges = new Map(); // "신청자>대상" -> { from, to, timer }
 const CHALLENGE_TIMEOUT_MS = 30 * 1000;
 
-// ===== [추가] 친구 데이터 캐시 =====
+// ===== 경쟁전 대기열 =====
+const rankedQueue = []; // 매칭을 기다리는 소켓들 (로그인한 사람만)
+function leaveRankedQueue(s) {
+    const i = rankedQueue.indexOf(s);
+    if (i >= 0) { rankedQueue.splice(i, 1); return true; }
+    return false;
+}
+
+// ===== 친구 데이터 캐시 =====
 // 친구 목록/받은 요청/보낸 요청을 서버 메모리에 보관. 친구 창이 10초마다 새로고침해도 앱스크립트를 부르지 않음.
 // 친구 요청/수락/삭제는 전부 이 서버를 거치므로, 그때마다 관련된 두 사람의 캐시를 무효화해 최신으로 유지함.
 // (시트를 직접 고친 경우를 대비해 5분이 지나면 자동으로 다시 읽음)
@@ -198,6 +206,7 @@ function cancelChallengesFor(username, reasonForOther) {
 
 // 로그아웃/접속 종료 시 온라인 목록과 대기 중인 신청 정리
 function clearUserSession(socket) {
+    leaveRankedQueue(socket);
     const name = socket.username;
     if (!name) return;
     if (onlineUsers.get(name) === socket) {
@@ -259,6 +268,8 @@ function cleanName(v) {
     return String(v == null ? '' : v).trim().slice(0, 40);
 }
 
+const nf = (v) => (Number.isFinite(Number(v)) ? Number(v) : 0);
+
 // ===== 방 / 팀전 설정 =====
 const TEAM_MAX = 5;     // 팀전은 한 팀당 최대 5명
 const WIN_SCORE = 5;    // 먼저 5라운드를 이기면 승리
@@ -276,7 +287,7 @@ function getPublicRoomList() {
         max: rooms[code].mode === 'team' ? TEAM_MAX * 2 : 2,
         mode: rooms[code].mode,
         started: !!rooms[code].started,
-        friend: !!rooms[code].private,
+        friend: !!rooms[code].private && !rooms[code].ranked,
         spectators: rooms[code].spectators.size
     }));
 }
@@ -291,8 +302,14 @@ function makeRoom(name, players, isPrivate, opts) {
         host: players[0] || null,
         mode: opts.mode === 'team' ? 'team' : '1v1',
         hidden: !!opts.hidden,
-        private: !!isPrivate,      // 친구 대결 신청으로 만들어진 방
-        started: !!isPrivate,      // 친구 대결 방은 만들어지는 즉시 시작됨
+        private: !!isPrivate,      // 친구 대결/경쟁전으로 만들어진 방
+        started: !!isPrivate,      // 친구 대결/경쟁전 방은 만들어지는 즉시 시작됨
+        ranked: false,             // 경쟁전 방 여부
+        rankedNames: {},           // (경쟁전) 소켓 id -> 계정 아이디 (나간 뒤에도 결과를 기록하기 위해 보관)
+        rankedDone: false,         // (경쟁전) 결과가 이미 기록됐는지
+        skillPhase: false,         // 첫 라운드 전 스킬(캐릭터) 선택 단계
+        skillOf: {},               // 소켓 id -> 고른 스킬
+        skillTimer: null,
         teamOf: {},                // (팀전) 소켓 id -> 0 | 1
         slotOf: {}, idOfSlot: [], teamOfSlot: [], nameOfSlot: [], idxOfSlot: [], connected: [], alive: [], n: 2,
         roundEnded: false, matchOver: false, roundTimer: null,
@@ -337,7 +354,7 @@ function broadcastRoomList() {
     io.emit('updateRoomList', getPublicRoomList());
 }
 
-// ===== [추가] 관전 =====
+// ===== 관전 =====
 const MAX_SPECTATORS = 10;
 const specChannel = (code) => code + '#s';
 
@@ -382,7 +399,7 @@ function endRoomSpectators(code, room, reason) {
     room.spectators.clear();
 }
 
-// ===== [추가] 친구 초대 (방 만들고 대기 중일 때 친구를 부름) =====
+// ===== 친구 초대 (방 만들고 대기 중일 때 친구를 부름) =====
 const pendingInvites = new Map(); // "초대한사람>받는사람" -> { from, to, code, timer }
 const INVITE_TIMEOUT_MS = 30 * 1000;
 
@@ -413,6 +430,125 @@ function cancelInvitesForRoom(code) {
     for (const [key, inv] of Array.from(pendingInvites.entries())) {
         if (inv.code === code) dropInvite(key);
     }
+}
+
+// ===== 스킬(캐릭터) 선택 단계 =====
+// 경기가 시작되면 모든 플레이어가 스킬을 하나씩 골라야 첫 라운드가 시작됨. 30초 안에 못 고르면 대시로 자동 선택.
+const SKILL_KEYS = new Set(['dash', 'para', 'grenade']);
+const SKILL_PICK_MS = 30 * 1000;
+
+function beginSkillPhase(code, room) {
+    clearTimeout(room.skillTimer);
+    room.skillPhase = true;
+    room.skillOf = {};
+    room.skillTimer = setTimeout(() => {
+        if (rooms[code] !== room || !room.skillPhase) return;
+        room.players.forEach(id => {
+            if (!room.skillOf[id]) {
+                room.skillOf[id] = 'dash';
+                const s = sockById(id);
+                if (s) s.emit('skillAutoPick', { skill: 'dash' });
+            }
+        });
+        finishSkillPhase(code, room);
+    }, SKILL_PICK_MS);
+}
+
+function finishSkillPhase(code, room) {
+    clearTimeout(room.skillTimer);
+    if (!room.skillPhase) return;
+    room.skillPhase = false;
+    io.to(code).emit('skillsReady');
+}
+
+function checkSkillsReady(code, room) {
+    if (!room || !room.skillPhase) return;
+    const total = room.players.length;
+    const count = room.players.filter(id => room.skillOf[id]).length;
+    io.to(code).emit('skillProgress', { count, total });
+    if (total > 0 && count >= total) finishSkillPhase(code, room);
+}
+
+// ===== 경쟁전 결과 기록 =====
+// 이긴 사람/진 사람의 소켓 id를 받아 계정 서버(Code.gs)에 점수를 반영하고, 두 사람에게 결과를 보냄.
+// 경기 도중에 나간 사람은 패배와 똑같이 처리됨 (leftId로 표시)
+async function settleRanked(room, winnerId, loserId, leftId) {
+    if (!room || !room.ranked || room.rankedDone) return;
+    room.rankedDone = true;
+    const wName = room.rankedNames[winnerId];
+    const lName = room.rankedNames[loserId];
+    if (!wName || !lName) return;
+
+    let res = null;
+    try {
+        res = await callAccountApi({ action: 'rankedResult', winner: wName, loser: lName });
+    } catch (e) {
+        res = null;
+    }
+    const wSock = sockById(winnerId);
+    const lSock = sockById(loserId);
+    if (!res || !res.success) {
+        const fail = { success: false, message: '경쟁전 기록을 저장하지 못했습니다.' };
+        if (wSock) wSock.emit('rankedResult', fail);
+        if (lSock) lSock.emit('rankedResult', fail);
+        return;
+    }
+    const left = !!leftId;
+    if (wSock) wSock.emit('rankedResult', { success: true, win: true, left, delta: res.winner.delta, points: res.winner.points, wins: res.winner.wins, losses: res.winner.losses });
+    if (lSock) lSock.emit('rankedResult', { success: true, win: false, left, delta: res.loser.delta, points: res.loser.points, wins: res.loser.wins, losses: res.loser.losses });
+}
+
+// ===== 1대1 대결 방 만들기 (친구 대결 / 경쟁전 공용) =====
+function startDuel(a, b, opts) {
+    opts = opts || {};
+    leaveRankedQueue(a);
+    leaveRankedQueue(b);
+    if (opts.ranked && Math.random() < 0.5) { const t = a; a = b; b = t; } // 경쟁전은 시작 위치를 랜덤으로
+
+    let code;
+    do { code = (opts.ranked ? 'r' : 'f') + Math.random().toString(36).slice(2, 8); } while (rooms[code]);
+    const name = opts.ranked ? '경쟁전 매치' : `${a.username} vs ${b.username}`;
+    const room = makeRoom(name, [a.id, b.id], true, { mode: '1v1' });
+    if (opts.ranked) {
+        room.ranked = true;
+        room.rankedNames = { [a.id]: a.username, [b.id]: b.username };
+    }
+    rooms[code] = room;
+    a.join(code);
+    b.join(code);
+    a.currentRoom = code;
+    b.currentRoom = code;
+
+    a.emit('challengeMatchStart', { code, isHost: true, ranked: !!opts.ranked });
+    b.emit('challengeMatchStart', { code, isHost: false, ranked: !!opts.ranked });
+    beginSkillPhase(code, room);
+    io.to(code).emit('gameStart');
+
+    broadcastRoomList(); // 대결 방도 멀티플레이 목록에 표시
+    broadcastPresence(a.username);
+    broadcastPresence(b.username);
+
+    // 두 사람이 받았거나 보낸 다른 신청은 모두 취소
+    cancelChallengesFor(a.username, `${a.username}님이 다른 대결을 시작했습니다.`);
+    cancelChallengesFor(b.username, `${b.username}님이 다른 대결을 시작했습니다.`);
+}
+
+// 대기열에서 두 명씩 짝지어 경기 시작 (티어 차이는 제한 없음)
+function tryRankedMatch() {
+    // 접속이 끊겼거나 방에 들어간 사람, 같은 아이디로 중복 접속한 사람은 걸러냄
+    const seen = new Map();
+    rankedQueue.forEach(s => {
+        if (s.connected && s.username && !s.currentRoom && !s.spectating) seen.set(s.username, s);
+    });
+    rankedQueue.length = 0;
+    seen.forEach(s => rankedQueue.push(s));
+
+    while (rankedQueue.length >= 2) {
+        const a = rankedQueue.shift();
+        const b = rankedQueue.shift();
+        startDuel(a, b, { ranked: true });
+    }
+    rankedQueue.forEach(s => s.emit('rankedQueueState', { searching: true, waiting: rankedQueue.length }));
 }
 
 // ===== (팀전) 라운드 / 경기 진행 - 서버가 판정함 =====
@@ -462,6 +598,8 @@ function endTeamMatch(code, room, winner, forfeit) {
 function teamBackToLobby(code, room) {
     if (rooms[code] !== room) return;
     clearTimeout(room.roundTimer);
+    clearTimeout(room.skillTimer);
+    room.skillPhase = false;
     room.started = false;
     room.matchOver = false;
     room.roundEnded = false;
@@ -477,6 +615,7 @@ function teamBackToLobby(code, room) {
 
 // 소켓을 현재 방에서 빼는 공통 처리 (방 나가기 / 접속 종료 / 다른 방으로 이동할 때 공용)
 // 1대1: 남은 인원이 없으면 방 삭제, 있으면 상대에게 playerLeft 알림. 관전자는 경기가 끝났으므로 내보냄
+//       경쟁전 도중에 나가면 그 사람은 패배 처리됨
 // 팀전: 방장이 나가면 다음 사람이 방장, 진행 중이면 그 사람은 탈락 처리(한 팀이 전부 나가면 상대 팀 승리)
 function removeFromRoom(socket) {
     const code = socket.currentRoom;
@@ -487,6 +626,13 @@ function removeFromRoom(socket) {
 
     socket.leave(code);
     const slot = room.slotOf[socket.id];
+
+    // 경쟁전 경기 도중 이탈 = 패배 (상대는 승리)
+    if (room.ranked && room.started && !room.rankedDone) {
+        const other = room.players.find(id => id !== socket.id);
+        if (other) settleRanked(room, other, socket.id, socket.id);
+    }
+
     room.players = room.players.filter(id => id !== socket.id);
     delete room.teamOf[socket.id];
     clearTimeout(room.resetTimer);
@@ -494,6 +640,7 @@ function removeFromRoom(socket) {
     if (room.mode === 'team') {
         if (room.players.length === 0) {
             clearTimeout(room.roundTimer);
+            clearTimeout(room.skillTimer);
             cancelInvitesForRoom(code);
             endRoomSpectators(code, room, '방이 사라졌습니다.');
             delete rooms[code];
@@ -512,6 +659,7 @@ function removeFromRoom(socket) {
                     if (conn[0] === 0 || conn[1] === 0) endTeamMatch(code, room, conn[0] === 0 ? 1 : 0, true);
                     else checkTeamRound(code, room);
                 }
+                if (room.skillPhase) checkSkillsReady(code, room); // 스킬을 고르던 중 나갔다면 남은 사람 기준으로 다시 확인
             } else if (hostChanged) {
                 cancelInvitesForRoom(code); // 대기실에서 방장이 바뀌면 이전 방장이 보낸 초대는 취소
             }
@@ -523,8 +671,12 @@ function removeFromRoom(socket) {
 
     cancelInvitesForRoom(code);
     endRoomSpectators(code, room, '플레이어가 나가서 경기가 끝났습니다.');
-    if (room.players.length === 0) delete rooms[code];
-    else io.to(code).emit('playerLeft');
+    if (room.players.length === 0) {
+        clearTimeout(room.skillTimer);
+        delete rooms[code];
+    } else {
+        io.to(code).emit('playerLeft');
+    }
 
     broadcastRoomList(); // 친구 대결 방도 목록에 보이므로 항상 알림
     return true;
@@ -535,17 +687,28 @@ io.on('connection', (socket) => {
     // 연결 시 현재 방 목록 전송
     socket.emit('updateRoomList', getPublicRoomList());
 
-    // [수정] 버전이 맞지 않는 클라이언트는 로그인/회원가입/비회원 멀티플레이/관전 등 모든 요청을 서버가 거부함
-    // (버전 확인 요청, 접속 직후 자동으로 가는 퀴즈 조회/핑 확인만 확인 전에 허용)
+    // [1.6] 버전은 접속(handshake) 때 함께 받음 - 접속 직후 다른 요청이 먼저 도착해도 "업데이트 필요"가 잘못 뜨지 않음
+    const authVer = socket.handshake && socket.handshake.auth && socket.handshake.auth.version;
+    if (authVer !== undefined && authVer !== null) {
+        socket.clientVersion = String(authVer).slice(0, 40);
+        socket.versionOk = socket.clientVersion === REQUIRED_VERSION;
+        if (!socket.versionOk) socket.emit('needUpdate', { required: REQUIRED_VERSION, current: socket.clientVersion });
+    }
+
+    // 버전이 맞지 않는 클라이언트는 로그인/회원가입/비회원 멀티플레이/관전 등 모든 요청을 서버가 거부함
+    // 버전 확인 전(옛 클라이언트)의 요청은 안내 없이 조용히 버림 (checkVersion, 퀴즈 조회, 핑 확인만 허용)
     socket.use((packet, next) => {
         const ev = packet[0];
         if (socket.versionOk === true || ev === 'checkVersion') return next();
-        if (socket.versionOk === undefined && (ev === 'getQuizzes' || ev === 'pingCheck')) return next();
+        if (socket.versionOk === undefined) {
+            if (ev === 'getQuizzes' || ev === 'pingCheck') return next();
+            return; // 버림
+        }
         socket.emit('needUpdate', { required: REQUIRED_VERSION, current: socket.clientVersion || '알 수 없음' });
         // next()를 부르지 않으면 이 요청은 버려짐
     });
 
-    // 클라이언트 버전 확인 - 클라이언트가 접속 직후 자신의 버전을 보내면 비교
+    // 옛 방식(접속 후 버전 전송)도 그대로 지원
     socket.on('checkVersion', (clientVersion) => {
         socket.clientVersion = String(clientVersion == null ? '' : clientVersion).slice(0, 40);
         socket.versionOk = socket.clientVersion === REQUIRED_VERSION;
@@ -637,7 +800,7 @@ io.on('connection', (socket) => {
         }
     });
 
-    // [수정] 퀴즈 문제 조회 - 서버 캐시에서 바로 응답 (없을 때만 앱스크립트 호출). 실패 시 빈 목록
+    // 퀴즈 문제 조회 - 서버 캐시에서 바로 응답 (없을 때만 앱스크립트 호출). 실패 시 빈 목록
     socket.on('getQuizzes', async () => {
         try {
             const result = await getQuizzesCached();
@@ -743,6 +906,7 @@ io.on('connection', (socket) => {
     });
 
     // 친구에게 1대1 대결 신청
+    // [1.6] 상대가 이미 나에게 신청해 둔 상태라면, 내가 신청하는 순간 수락한 것으로 보고 바로 대결을 시작함
     socket.on('challengeFriend', async (data) => {
         const fail = (message) => socket.emit('challengeResult', { success: false, message });
         if (!socket.username) return fail('로그인이 필요합니다.');
@@ -752,10 +916,10 @@ io.on('connection', (socket) => {
         if (socket.currentRoom) return fail('이미 방에 있습니다. 방에서 나간 뒤 신청하세요.');
 
         const key = `${from}>${to}`;
+        const reverseKey = `${to}>${from}`;
         if (pendingChallenges.has(key)) return fail('이미 신청했습니다. 응답을 기다려주세요.');
-        if (pendingChallenges.has(`${to}>${from}`)) return fail('상대가 먼저 신청했습니다. 받은 신청을 수락해주세요.');
 
-        // [수정] 매번 앱스크립트를 부르지 않고 서버에 보관된 친구 목록으로 확인 (신청 응답이 훨씬 빨라짐)
+        // 매번 앱스크립트를 부르지 않고 서버에 보관된 친구 목록으로 확인 (신청 응답이 훨씬 빨라짐)
         let friendData;
         try {
             friendData = await getFriendData(from);
@@ -769,6 +933,15 @@ io.on('connection', (socket) => {
         if (target.currentRoom || target.spectating) return fail(`${to}님은 게임 중이거나 방에서 대기 중입니다.`);
         if (socket.currentRoom) return fail('이미 방에 있습니다. 방에서 나간 뒤 신청하세요.'); // 응답을 기다리는 사이 방에 들어간 경우
         if (pendingChallenges.has(key)) return fail('이미 신청했습니다. 응답을 기다려주세요.'); // 대기 중에 같은 신청이 겹친 경우
+
+        // 상대가 먼저 보낸 신청이 있으면 바로 대결 시작 (먼저 신청한 사람이 방장)
+        const rev = pendingChallenges.get(reverseKey);
+        if (rev) {
+            clearTimeout(rev.timer);
+            pendingChallenges.delete(reverseKey);
+            startDuel(target, socket);
+            return;
+        }
 
         const timer = setTimeout(() => {
             pendingChallenges.delete(key);
@@ -811,34 +984,40 @@ io.on('connection', (socket) => {
             return;
         }
 
-        // 친구 전용 비공개 방을 만들어 두 사람을 바로 입장시킴 (방 목록에는 보이지 않음)
-        let code;
-        do { code = 'f' + Math.random().toString(36).slice(2, 8); } while (rooms[code]);
-        rooms[code] = makeRoom(`${from} vs ${me}`, [challenger.id, socket.id], true, { mode: '1v1' });
-        challenger.join(code);
-        socket.join(code);
-        challenger.currentRoom = code;
-        socket.currentRoom = code;
-
-        challenger.emit('challengeMatchStart', { code, isHost: true });
-        socket.emit('challengeMatchStart', { code, isHost: false });
-        io.to(code).emit('gameStart');
-
-        broadcastRoomList(); // 친구 대결 방도 멀티플레이 목록에 표시
-        broadcastPresence(from);
-        broadcastPresence(me);
-
-        // 두 사람이 받았거나 보낸 다른 신청은 모두 취소
-        cancelChallengesFor(from, `${from}님이 다른 대결을 시작했습니다.`);
-        cancelChallengesFor(me, `${me}님이 다른 대결을 시작했습니다.`);
+        // 친구 전용 방을 만들어 두 사람을 바로 입장시킴
+        startDuel(challenger, socket);
     });
 
-    // ===== [추가] 핑 측정 - 클라이언트가 응답 콜백을 보내면 바로 호출해 왕복 시간을 재게 함 =====
+    // ===== 핑 측정 - 클라이언트가 응답 콜백을 보내면 바로 호출해 왕복 시간을 재게 함 =====
     socket.on('pingCheck', (cb) => {
         if (typeof cb === 'function') cb();
     });
 
-    // ===== [추가] 친구 초대 =====
+    // ===== [1.6] 경쟁전 (랜덤 매칭, 로그인한 사람만, 1대1) =====
+    socket.on('getRanked', async () => {
+        if (!socket.username) { socket.emit('rankedData', { success: false, message: '로그인이 필요합니다.' }); return; }
+        try {
+            const r = await callAccountApi({ action: 'getRanked', username: socket.username });
+            socket.emit('rankedData', r);
+        } catch (err) {
+            socket.emit('rankedData', { success: false, message: '계정 서버 연결 실패' });
+        }
+    });
+
+    socket.on('rankedQueue', () => {
+        const stop = (message) => socket.emit('rankedQueueState', { searching: false, message });
+        if (!socket.username) return stop('로그인한 계정만 경쟁전을 할 수 있습니다.');
+        if (socket.currentRoom || socket.spectating) return stop('방에서 나간 뒤 이용하세요.');
+        if (!rankedQueue.includes(socket)) rankedQueue.push(socket);
+        socket.emit('rankedQueueState', { searching: true, waiting: rankedQueue.length });
+        tryRankedMatch();
+    });
+
+    socket.on('rankedCancel', () => {
+        if (leaveRankedQueue(socket)) socket.emit('rankedQueueState', { searching: false });
+    });
+
+    // ===== 친구 초대 =====
     socket.on('inviteFriend', async (data) => {
         const to = cleanName(data && data.to);
         const fail = (message) => socket.emit('inviteResult', { success: false, message, to });
@@ -915,7 +1094,7 @@ io.on('connection', (socket) => {
         inviter.emit('inviteResult', { success: true, message: `${me}님이 초대를 수락했습니다.`, to: me });
     });
 
-    // ===== [추가] 관전 =====
+    // ===== 관전 =====
     socket.on('spectateRoom', (data) => {
         const code = cleanName(data && data.code);
         const room = rooms[code];
@@ -925,6 +1104,7 @@ io.on('connection', (socket) => {
         if (socket.spectating === code) return;
         if (room.spectators.size >= MAX_SPECTATORS) { socket.emit('errorMsg', '관전 인원이 가득 찼습니다.'); return; }
 
+        leaveRankedQueue(socket);
         stopSpectating(socket); // 다른 방을 보고 있었다면 먼저 나감
         room.spectators.add(socket.id);
         socket.join(specChannel(code));
@@ -962,6 +1142,7 @@ io.on('connection', (socket) => {
             return;
         }
 
+        leaveRankedQueue(socket);
         stopSpectating(socket);
         removeFromRoom(socket); // 이전 방에 남아 있었다면 정리
 
@@ -1002,6 +1183,7 @@ io.on('connection', (socket) => {
             return;
         }
 
+        leaveRankedQueue(socket);
         stopSpectating(socket);
         removeFromRoom(socket); // 다른 방에 있었다면 먼저 나감
 
@@ -1024,11 +1206,12 @@ io.on('connection', (socket) => {
         room.started = true;
         cancelInvitesForRoom(roomCode); // 방이 찼으니 남은 초대는 취소
         broadcastRoomList();
+        beginSkillPhase(roomCode, room);
         io.to(roomCode).emit('gameStart');
         broadcastPresence(socket.username);
     });
 
-    // ===== [추가] 방 옵션 (방장): 공개 / 비공개 =====
+    // ===== 방 옵션 (방장): 공개 / 비공개 =====
     socket.on('roomOption', (data) => {
         const code = socket.currentRoom;
         const room = code && rooms[code];
@@ -1038,7 +1221,7 @@ io.on('connection', (socket) => {
         broadcastRoomList();
     });
 
-    // ===== [추가] 팀전 대기실: 방장이 플레이어를 다른 팀으로 옮김 =====
+    // ===== 팀전 대기실: 방장이 플레이어를 다른 팀으로 옮김 =====
     socket.on('teamMove', (data) => {
         const code = socket.currentRoom;
         const room = code && rooms[code];
@@ -1053,7 +1236,7 @@ io.on('connection', (socket) => {
         emitRoomState(code);
     });
 
-    // ===== [추가] 팀전 시작 (방장만) =====
+    // ===== 팀전 시작 (방장만) =====
     socket.on('startTeamGame', () => {
         const code = socket.currentRoom;
         const room = code && rooms[code];
@@ -1086,6 +1269,7 @@ io.on('connection', (socket) => {
         room.roundEnded = false;
         clearTimeout(room.roundTimer);
         cancelInvitesForRoom(code);
+        beginSkillPhase(code, room); // 모두 스킬을 골라야 첫 라운드가 시작됨
 
         // 게임 중에는 상대 팀 닉네임이 보이지 않도록, 받는 사람마다 상대 팀 이름을 "적 N"으로 바꿔서 보냄
         room.idOfSlot.forEach((id, slot) => {
@@ -1100,6 +1284,17 @@ io.on('connection', (socket) => {
         });
         emitRoomState(code);
         broadcastRoomList();
+    });
+
+    // ===== [1.6] 스킬(캐릭터) 선택 =====
+    socket.on('pickSkill', (data) => {
+        const code = socket.currentRoom;
+        const room = code && rooms[code];
+        if (!room || !room.skillPhase || !room.players.includes(socket.id)) return;
+        const skill = data && data.skill;
+        if (!SKILL_KEYS.has(skill) || room.skillOf[socket.id]) return;
+        room.skillOf[socket.id] = skill;
+        checkSkillsReady(code, room);
     });
 
     // 3. 방 나가기 및 취소 (유령 방 방지)
@@ -1122,10 +1317,13 @@ io.on('connection', (socket) => {
 
         if (slot >= 0 && data) {
             // 관전자가 1인칭으로 볼 수 있도록 시선 위아래(pitch)도 함께 전달 (숫자로 보정)
-            const num = (v) => (Number.isFinite(Number(v)) ? Number(v) : 0);
-            const pos = { x: num(data.x), y: num(data.y), z: num(data.z), yaw: num(data.yaw), pitch: Math.max(-1.6, Math.min(1.6, num(data.pitch))) };
+            const pos = { x: nf(data.x), y: nf(data.y), z: nf(data.z), yaw: nf(data.yaw), pitch: Math.max(-1.6, Math.min(1.6, nf(data.pitch))) };
             room.last[slot] = pos;
-            specEmit(code, room, 'specMove', { i: slot, x: pos.x, y: pos.y, z: pos.z, yaw: pos.yaw, pitch: pos.pitch }, true);
+            // [1.6] 들고 있는 무기도 위치 패킷에 실려 오므로, 무기 교체 패킷을 놓쳐도 곧바로 바로잡힘
+            const wv = Number(data.weapon);
+            const w = (wv >= 1 && wv <= 4) ? wv : 0;
+            if (w) room.weapon[slot] = w;
+            specEmit(code, room, 'specMove', { i: slot, x: pos.x, y: pos.y, z: pos.z, yaw: pos.yaw, pitch: pos.pitch, w: w || undefined }, true);
         }
     });
 
@@ -1137,8 +1335,9 @@ io.on('connection', (socket) => {
         if (room.mode === 'team' && !room.started) return;
         socket.to(code).emit('enemyWeaponChanged', Object.assign({}, data, { pid: slot }));
         if (slot >= 0 && data) {
-            room.weapon[slot] = data.weapon;
-            specEmit(code, room, 'specWeapon', { i: slot, weapon: data.weapon });
+            const wv = Number(data.weapon);
+            if (wv >= 1 && wv <= 4) room.weapon[slot] = wv;
+            specEmit(code, room, 'specWeapon', { i: slot, weapon: wv });
         }
     });
 
@@ -1150,6 +1349,48 @@ io.on('connection', (socket) => {
         if (room.mode === 'team' && (!room.started || !room.alive[slot])) return;
         socket.to(code).emit('enemyFired', Object.assign({}, data, { pid: slot }));
         if (slot >= 0) specEmit(code, room, 'specFire', { i: slot, weapon: data && data.weapon, mode: data && data.mode });
+    });
+
+    // ===== [1.6] 섬광탄 / 스킬 투사체 (던짐 → 터짐) =====
+    // 서버는 그대로 전달만 함. 섬광/어둠 효과는 맞는 사람의 화면에서 계산하고, 수류탄 피해는 던진 사람이 계산해 hit로 보냄
+    const PROJ_KINDS = new Set(['flash', 'para', 'grenade']);
+    socket.on('skillThrow', (d) => {
+        const code = socket.currentRoom;
+        const room = code && rooms[code];
+        if (!room || !d || !PROJ_KINDS.has(d.kind) || room.skillPhase) return;
+        const slot = slotOfSocket(room, socket);
+        if (room.mode === 'team' && (!room.started || !room.alive[slot])) return;
+        const out = {
+            pid: slot, id: nf(d.id), kind: d.kind,
+            x: nf(d.x), y: nf(d.y), z: nf(d.z), vx: nf(d.vx), vy: nf(d.vy), vz: nf(d.vz),
+            fuse: Math.max(0, Math.min(5000, nf(d.fuse)))
+        };
+        socket.to(code).emit('skillThrow', out);
+        if (slot >= 0) specEmit(code, room, 'specSkillThrow', Object.assign({ i: slot }, out));
+    });
+
+    socket.on('skillPop', (d) => {
+        const code = socket.currentRoom;
+        const room = code && rooms[code];
+        if (!room || !d || !PROJ_KINDS.has(d.kind)) return;
+        if (room.mode === 'team' && !room.started) return;
+        const slot = slotOfSocket(room, socket);
+        const out = { pid: slot, id: nf(d.id), kind: d.kind, x: nf(d.x), y: nf(d.y), z: nf(d.z) };
+        socket.to(code).emit('skillPop', out);
+        if (slot >= 0) specEmit(code, room, 'specSkillPop', Object.assign({ i: slot }, out));
+    });
+
+    // ===== [1.6] 내 체력 보고 - 관전자 화면의 체력 표시는 맞은 본인이 알려주는 값을 그대로 사용 =====
+    socket.on('myHp', (d) => {
+        const code = socket.currentRoom;
+        const room = code && rooms[code];
+        if (!room) return;
+        const slot = slotOfSocket(room, socket);
+        if (slot < 0 || slot >= room.hp.length) return;
+        if (room.mode === 'team' && !room.started) return;
+        const hp = Math.max(0, Math.min(100, Math.round(nf(d && d.hp))));
+        room.hp[slot] = hp;
+        specEmit(code, room, 'specHp', { i: slot, hp });
     });
 
     socket.on('hit', (data) => {
@@ -1166,18 +1407,10 @@ io.on('connection', (socket) => {
             if (!Number.isInteger(tSlot) || tSlot < 0 || tSlot >= room.n || !room.alive[tSlot]) return;
             if (room.teamOfSlot[tSlot] === room.teamOfSlot[slot]) return;
             io.to(room.idOfSlot[tSlot]).emit('takeDamage', { damage: dmg, from: slot });
-            room.hp[tSlot] = Math.max(0, room.hp[tSlot] - dmg);
-            specEmit(code, room, 'specHp', { i: tSlot, hp: room.hp[tSlot] });
             return;
         }
 
         socket.to(code).emit('takeDamage', data);
-        // 관전자용 체력 추적 (실제 판정은 기존처럼 각 클라이언트가 함)
-        if (slot >= 0) {
-            const victim = 1 - slot;
-            room.hp[victim] = Math.max(0, room.hp[victim] - dmg);
-            specEmit(code, room, 'specHp', { i: victim, hp: room.hp[victim] });
-        }
     });
 
     socket.on('iDied', (data) => {
@@ -1207,6 +1440,10 @@ io.on('connection', (socket) => {
             clearTimeout(room.resetTimer);
             if (room.score[winner] >= WIN_SCORE) {
                 specEmit(code, room, 'specMatchEnd', { winner, score: room.score });
+                // [1.6] 경쟁전: 마지막 라운드가 끝나면 바로 결과를 기록
+                if (room.ranked && room.players[winner] && room.players[slot]) {
+                    settleRanked(room, room.players[winner], room.players[slot], null);
+                }
             } else {
                 // 라운드가 다시 시작되는 시점(클라이언트가 약 1.5초 뒤 시작)에 체력을 되돌림
                 room.resetTimer = setTimeout(() => {
@@ -1229,6 +1466,6 @@ io.on('connection', (socket) => {
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
     console.log(`Server running on port ${PORT}`);
-    // [추가] 서버가 켜질 때 퀴즈를 미리 받아 두고 앱스크립트도 깨워둠 (첫 접속자가 느리게 기다리지 않도록)
+    // 서버가 켜질 때 퀴즈를 미리 받아 두고 앱스크립트도 깨워둠 (첫 접속자가 느리게 기다리지 않도록)
     fetchQuizzesFromGas().catch(() => {});
 });
