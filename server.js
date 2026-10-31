@@ -274,6 +274,13 @@ const nf = (v) => (Number.isFinite(Number(v)) ? Number(v) : 0);
 const TEAM_MAX = 5;     // 팀전은 한 팀당 최대 5명
 const WIN_SCORE = 5;    // 먼저 5라운드를 이기면 승리
 
+// ===== 데스매치 (서버가 켜져 있는 동안 항상 열려 있는 방) =====
+const DM_CODE = 'DM1';
+const DM_MAX = 10;                 // 동시에 들어올 수 있는 최대 인원
+const DM_MIN_RESPAWN_MS = 2000;    // 죽은 뒤 이 시간이 지나야 부활 요청이 받아들여짐
+const DM_PROTECT_MS = 2500;        // 부활 직후 무적 시간
+const isSlotMode = (room) => !!room && (room.mode === 'team' || room.mode === 'dm'); // 플레이어마다 고정 번호(슬롯)를 쓰는 방
+
 const sockById = (id) => io.sockets.sockets.get(id);
 function nameOf(sock) { return (sock && (sock.username || sock.guestName)) || '손님'; }
 function nameOfId(id) { return nameOf(sockById(id)); }
@@ -284,9 +291,9 @@ function getPublicRoomList() {
         code: code,
         name: rooms[code].name,
         count: rooms[code].players.length,
-        max: rooms[code].mode === 'team' ? TEAM_MAX * 2 : 2,
+        max: rooms[code].mode === 'team' ? TEAM_MAX * 2 : (rooms[code].mode === 'dm' ? DM_MAX : 2),
         mode: rooms[code].mode,
-        started: !!rooms[code].started,
+        started: rooms[code].mode === 'dm' ? false : !!rooms[code].started, // 데스매치는 언제든 들어갈 수 있으므로 "시작 전" 방처럼 보여줌
         friend: !!rooms[code].private && !rooms[code].ranked,
         spectators: rooms[code].spectators.size
     }));
@@ -300,7 +307,7 @@ function makeRoom(name, players, isPrivate, opts) {
         name,
         players,
         host: players[0] || null,
-        mode: opts.mode === 'team' ? 'team' : '1v1',
+        mode: opts.mode === 'team' ? 'team' : (opts.mode === 'dm' ? 'dm' : '1v1'),
         hidden: !!opts.hidden,
         private: !!isPrivate,      // 친구 대결/경쟁전으로 만들어진 방
         started: !!isPrivate,      // 친구 대결/경쟁전 방은 만들어지는 즉시 시작됨
@@ -324,6 +331,7 @@ function makeRoom(name, players, isPrivate, opts) {
 
 // 방에 더 들어올 자리가 있는지 (시작 전이고 정원 미만)
 function roomHasSpace(room) {
+    if (room && room.mode === 'dm') return room.players.length < DM_MAX;
     if (!room || room.started) return false;
     return room.mode === 'team' ? room.players.length < TEAM_MAX * 2 : room.players.length < 2;
 }
@@ -469,6 +477,44 @@ function checkSkillsReady(code, room) {
     if (total > 0 && count >= total) finishSkillPhase(code, room);
 }
 
+// ===== 킬로그 =====
+// 죽은 사람이 보고한 무기/부위와 함께 방 안 모두에게 보냄. 팀전에서는 상대 팀 이름이 "적 N"으로 가려짐
+const KILL_WEAPONS = new Set([1, 2, 3, 5]);            // 1 권총, 2 칼, 3 돌격소총, 5 수류탄
+const KILL_PARTS = new Set(['head', 'body', 'legs', 'blast']);
+
+function emitKillFeed(code, room, killerSlot, victimSlot, weapon, part) {
+    weapon = KILL_WEAPONS.has(Number(weapon)) ? Number(weapon) : 0;
+    part = KILL_PARTS.has(part) ? part : '';
+    const slotMode = isSlotMode(room);
+    const nameAt = (slot) => slotMode ? (room.nameOfSlot[slot] || '플레이어') : playerNameAt(room, slot);
+    const recipients = slotMode
+        ? room.idOfSlot.map((id, sl) => ({ id, sl })).filter(r => r.id && room.connected[r.sl])
+        : room.players.map((id, sl) => ({ id, sl }));
+    recipients.forEach(({ id, sl }) => {
+        const view = (slot) => {
+            if (slot < 0) return { name: '', me: false, ally: false };
+            let shown = nameAt(slot);
+            const sameTeam = room.mode === 'team' ? room.teamOfSlot[slot] === room.teamOfSlot[sl] : slot === sl;
+            if (room.mode === 'team' && !sameTeam) shown = `적 ${room.idxOfSlot[slot] + 1}`;
+            return { name: shown, me: slot === sl, ally: sameTeam };
+        };
+        io.to(id).emit('killFeed', { killer: view(killerSlot), victim: view(victimSlot), weapon, part });
+    });
+    specEmit(code, room, 'specKill', {
+        killer: killerSlot >= 0 ? nameAt(killerSlot) : '', victim: nameAt(victimSlot), weapon, part
+    });
+}
+
+// 데스매치 점수판 (킬/데스)을 방 안 모두에게 보냄
+function emitDmScores(code, room) {
+    io.to(code).emit('dmScores', { kills: room.kills, deaths: room.deaths });
+}
+
+// 슬롯 번호로 소켓 id 찾기 (1대1은 입장 순서)
+function idOfSlotAny(room, slot) {
+    return isSlotMode(room) ? room.idOfSlot[slot] : room.players[slot];
+}
+
 // ===== 경쟁전 결과 기록 =====
 // 이긴 사람/진 사람의 소켓 id를 받아 계정 서버(Code.gs)에 점수를 반영하고, 두 사람에게 결과를 보냄.
 // 경기 도중에 나간 사람은 패배와 똑같이 처리됨 (leftId로 표시)
@@ -519,8 +565,11 @@ function startDuel(a, b, opts) {
     a.currentRoom = code;
     b.currentRoom = code;
 
+    console.log(`[대결 시작] ${opts.ranked ? '경쟁전' : '친구 대결'} ${a.username} vs ${b.username} (방 ${code})`);
     a.emit('challengeMatchStart', { code, isHost: true, ranked: !!opts.ranked });
     b.emit('challengeMatchStart', { code, isHost: false, ranked: !!opts.ranked });
+    a.emit('opponentName', { name: nameOf(b) });
+    b.emit('opponentName', { name: nameOf(a) });
     beginSkillPhase(code, room);
     io.to(code).emit('gameStart');
 
@@ -538,7 +587,10 @@ function tryRankedMatch() {
     // 접속이 끊겼거나 방에 들어간 사람, 같은 아이디로 중복 접속한 사람은 걸러냄
     const seen = new Map();
     rankedQueue.forEach(s => {
-        if (s.connected && s.username && !s.currentRoom && !s.spectating) seen.set(s.username, s);
+        if (!(s.connected && s.username && !s.currentRoom && !s.spectating)) return;
+        const prev = seen.get(s.username);
+        if (prev && prev !== s) prev.emit('rankedQueueState', { searching: false, message: '같은 계정으로 다른 곳에서 대기해서 이쪽 대기는 취소되었습니다.' });
+        seen.set(s.username, s);
     });
     rankedQueue.length = 0;
     seen.forEach(s => rankedQueue.push(s));
@@ -637,6 +689,22 @@ function removeFromRoom(socket) {
     delete room.teamOf[socket.id];
     clearTimeout(room.resetTimer);
 
+    if (room.mode === 'dm') {
+        // 데스매치는 사람이 모두 나가도 방이 사라지지 않음
+        if (slot !== undefined) {
+            room.connected[slot] = false;
+            room.alive[slot] = false;
+            room.idOfSlot[slot] = null;
+            room.nameOfSlot[slot] = '';
+            room.last[slot] = null;
+            delete room.slotOf[socket.id];
+            io.to(code).emit('teamPlayerLeft', { slot });
+            emitDmScores(code, room);
+        }
+        broadcastRoomList();
+        return true;
+    }
+
     if (room.mode === 'team') {
         if (room.players.length === 0) {
             clearTimeout(room.roundTimer);
@@ -680,6 +748,64 @@ function removeFromRoom(socket) {
 
     broadcastRoomList(); // 친구 대결 방도 목록에 보이므로 항상 알림
     return true;
+}
+
+function createDeathmatchRoom() {
+    const r = makeRoom('[데스매치] 24시간 상시', [], false, { mode: 'dm' });
+    r.started = true;
+    r.permanent = true;
+    r.n = DM_MAX;
+    r.slotOf = {};
+    r.idOfSlot = Array(DM_MAX).fill(null);
+    r.teamOfSlot = Array.from({ length: DM_MAX }, (_, i) => i); // 모두가 서로 적 (팀이 따로 없음)
+    r.nameOfSlot = Array(DM_MAX).fill('');
+    r.idxOfSlot = Array.from({ length: DM_MAX }, (_, i) => i);
+    r.connected = Array(DM_MAX).fill(false);
+    r.alive = Array(DM_MAX).fill(false);
+    r.hp = Array(DM_MAX).fill(100);
+    r.weapon = Array(DM_MAX).fill(3);
+    r.last = Array(DM_MAX).fill(null);
+    r.kills = Array(DM_MAX).fill(0);
+    r.deaths = Array(DM_MAX).fill(0);
+    r.inv = Array(DM_MAX).fill(0);       // 이 시각까지 무적
+    r.diedAt = Array(DM_MAX).fill(0);
+    rooms[DM_CODE] = r;
+}
+createDeathmatchRoom();
+
+// 데스매치에 들어가기 - 빈 슬롯 하나를 받고, 첫 스폰(dmRespawn)을 하기 전까지는 보이지도 맞지도 않음
+function joinDeathmatch(socket, room, code) {
+    if (room.players.length >= DM_MAX) { socket.emit('errorMsg', '방이 이미 가득 찼습니다.'); return; }
+    leaveRankedQueue(socket);
+    stopSpectating(socket);
+    removeFromRoom(socket); // 다른 방에 있었다면 먼저 나감
+    const slot = room.connected.findIndex(c => !c);
+    if (slot < 0) { socket.emit('errorMsg', '방이 이미 가득 찼습니다.'); return; }
+
+    room.players.push(socket.id);
+    socket.join(code);
+    socket.currentRoom = code;
+    room.slotOf[socket.id] = slot;
+    room.idOfSlot[slot] = socket.id;
+    room.nameOfSlot[slot] = nameOf(socket);
+    room.connected[slot] = true;
+    room.alive[slot] = false;
+    room.hp[slot] = 100;
+    room.weapon[slot] = 3;
+    room.kills[slot] = 0;
+    room.deaths[slot] = 0;
+    room.inv[slot] = 0;
+    room.last[slot] = null;
+
+    const players = [];
+    for (let sl = 0; sl < DM_MAX; sl++) {
+        if (room.connected[sl]) players.push({ slot: sl, name: room.nameOfSlot[sl], k: room.kills[sl], d: room.deaths[sl] });
+    }
+    socket.emit('dmStart', { code, name: room.name, you: { slot }, players });
+    socket.to(code).emit('dmPlayerJoined', { slot, name: room.nameOfSlot[slot] });
+    emitDmScores(code, room);
+    broadcastRoomList();
+    broadcastPresence(socket.username);
 }
 
 io.on('connection', (socket) => {
@@ -1008,7 +1134,12 @@ io.on('connection', (socket) => {
         const stop = (message) => socket.emit('rankedQueueState', { searching: false, message });
         if (!socket.username) return stop('로그인한 계정만 경쟁전을 할 수 있습니다.');
         if (socket.currentRoom || socket.spectating) return stop('방에서 나간 뒤 이용하세요.');
+        // 같은 계정이 이미 다른 곳에서 대기 중이면 자기 자신과는 매칭될 수 없으므로 안내
+        if (rankedQueue.some(s => s !== socket && s.username === socket.username)) {
+            return stop('같은 계정이 이미 대기 중입니다. 서로 다른 계정 두 개로 접속해야 매칭됩니다.');
+        }
         if (!rankedQueue.includes(socket)) rankedQueue.push(socket);
+        console.log(`[경쟁전] ${socket.username} 대기열 입장 (대기 ${rankedQueue.length}명)`);
         socket.emit('rankedQueueState', { searching: true, waiting: rankedQueue.length });
         tryRankedMatch();
     });
@@ -1025,7 +1156,7 @@ io.on('connection', (socket) => {
 
         const code = socket.currentRoom;
         const room = code && rooms[code];
-        if (!room || room.private) return fail('방을 만든 뒤에만 초대할 수 있습니다.');
+        if (!room || room.private || room.permanent) return fail('방을 만든 뒤에만 초대할 수 있습니다.');
         if (room.host !== socket.id) return fail('방장만 초대할 수 있습니다.');
         if (!roomHasSpace(room)) return fail(room.started ? '이미 게임이 시작되었습니다.' : '방이 가득 찼습니다.');
 
@@ -1099,6 +1230,7 @@ io.on('connection', (socket) => {
         const code = cleanName(data && data.code);
         const room = rooms[code];
         if (!room) { socket.emit('errorMsg', '존재하지 않는 방입니다.'); return; }
+        if (room.mode === 'dm') { socket.emit('errorMsg', '데스매치는 관전할 수 없습니다. 직접 들어와서 참여하세요.'); return; }
         if (!room.started || (room.mode !== 'team' && room.players.length < 2)) { socket.emit('errorMsg', '아직 경기가 시작되지 않은 방입니다.'); return; }
         if (socket.currentRoom) { socket.emit('errorMsg', '방에 있는 동안에는 관전할 수 없습니다.'); return; }
         if (socket.spectating === code) return;
@@ -1174,6 +1306,8 @@ io.on('connection', (socket) => {
         // 자기 방에 다시 들어가 혼자 게임이 시작되는 문제 방지
         if (room.players.includes(socket.id)) return;
 
+        if (room.mode === 'dm') { joinDeathmatch(socket, room, roomCode); return; }
+
         if (room.started) {
             socket.emit('errorMsg', '이미 게임이 시작된 방입니다. 목록에서 관전할 수 있습니다.');
             return;
@@ -1207,6 +1341,11 @@ io.on('connection', (socket) => {
         cancelInvitesForRoom(roomCode); // 방이 찼으니 남은 초대는 취소
         broadcastRoomList();
         beginSkillPhase(roomCode, room);
+        if (room.players.length === 2) {
+            const s0 = sockById(room.players[0]);
+            if (s0) s0.emit('opponentName', { name: nameOf(socket) });
+            socket.emit('opponentName', { name: nameOf(s0) });
+        }
         io.to(roomCode).emit('gameStart');
         broadcastPresence(socket.username);
     });
@@ -1312,7 +1451,7 @@ io.on('connection', (socket) => {
         const room = code && rooms[code];
         if (!room) return;
         const slot = slotOfSocket(room, socket);
-        if (room.mode === 'team' && (!room.started || !room.alive[slot])) return; // 대기실이거나 이미 죽은 사람의 위치는 무시
+        if (isSlotMode(room) && (!room.started || !room.alive[slot])) return; // 대기실이거나 이미 죽은 사람의 위치는 무시
         socket.to(code).volatile.emit('playerMoved', Object.assign({}, data, { pid: slot }));
 
         if (slot >= 0 && data) {
@@ -1320,10 +1459,11 @@ io.on('connection', (socket) => {
             const pos = { x: nf(data.x), y: nf(data.y), z: nf(data.z), yaw: nf(data.yaw), pitch: Math.max(-1.6, Math.min(1.6, nf(data.pitch))) };
             room.last[slot] = pos;
             // [1.6] 들고 있는 무기도 위치 패킷에 실려 오므로, 무기 교체 패킷을 놓쳐도 곧바로 바로잡힘
+            // (0 = 스킬/장비를 쓰는 동안의 맨손 상태)
             const wv = Number(data.weapon);
-            const w = (wv >= 1 && wv <= 4) ? wv : 0;
-            if (w) room.weapon[slot] = w;
-            specEmit(code, room, 'specMove', { i: slot, x: pos.x, y: pos.y, z: pos.z, yaw: pos.yaw, pitch: pos.pitch, w: w || undefined }, true);
+            const w = (wv >= 0 && wv <= 4 && Number.isInteger(wv)) ? wv : -1;
+            if (w > 0) room.weapon[slot] = w;
+            specEmit(code, room, 'specMove', { i: slot, x: pos.x, y: pos.y, z: pos.z, yaw: pos.yaw, pitch: pos.pitch, w: w >= 0 ? w : undefined }, true);
         }
     });
 
@@ -1337,7 +1477,7 @@ io.on('connection', (socket) => {
         if (slot >= 0 && data) {
             const wv = Number(data.weapon);
             if (wv >= 1 && wv <= 4) room.weapon[slot] = wv;
-            specEmit(code, room, 'specWeapon', { i: slot, weapon: wv });
+            if (wv >= 0 && wv <= 4) specEmit(code, room, 'specWeapon', { i: slot, weapon: wv });
         }
     });
 
@@ -1346,7 +1486,7 @@ io.on('connection', (socket) => {
         const room = code && rooms[code];
         if (!room) return;
         const slot = slotOfSocket(room, socket);
-        if (room.mode === 'team' && (!room.started || !room.alive[slot])) return;
+        if (isSlotMode(room) && (!room.started || !room.alive[slot])) return;
         socket.to(code).emit('enemyFired', Object.assign({}, data, { pid: slot }));
         if (slot >= 0) specEmit(code, room, 'specFire', { i: slot, weapon: data && data.weapon, mode: data && data.mode });
     });
@@ -1359,7 +1499,7 @@ io.on('connection', (socket) => {
         const room = code && rooms[code];
         if (!room || !d || !PROJ_KINDS.has(d.kind) || room.skillPhase) return;
         const slot = slotOfSocket(room, socket);
-        if (room.mode === 'team' && (!room.started || !room.alive[slot])) return;
+        if (isSlotMode(room) && (!room.started || !room.alive[slot])) return;
         const out = {
             pid: slot, id: nf(d.id), kind: d.kind,
             x: nf(d.x), y: nf(d.y), z: nf(d.z), vx: nf(d.vx), vy: nf(d.vy), vz: nf(d.vz),
@@ -1373,7 +1513,7 @@ io.on('connection', (socket) => {
         const code = socket.currentRoom;
         const room = code && rooms[code];
         if (!room || !d || !PROJ_KINDS.has(d.kind)) return;
-        if (room.mode === 'team' && !room.started) return;
+        if (isSlotMode(room) && !room.started) return;
         const slot = slotOfSocket(room, socket);
         const out = { pid: slot, id: nf(d.id), kind: d.kind, x: nf(d.x), y: nf(d.y), z: nf(d.z) };
         socket.to(code).emit('skillPop', out);
@@ -1387,10 +1527,72 @@ io.on('connection', (socket) => {
         if (!room) return;
         const slot = slotOfSocket(room, socket);
         if (slot < 0 || slot >= room.hp.length) return;
-        if (room.mode === 'team' && !room.started) return;
+        if (isSlotMode(room) && !room.started) return;
         const hp = Math.max(0, Math.min(100, Math.round(nf(d && d.hp))));
         room.hp[slot] = hp;
         specEmit(code, room, 'specHp', { i: slot, hp });
+    });
+
+    // ===== 데스매치 부활 (죽은 뒤 일정 시간이 지나야 받아들여짐. 처음 스폰할 때도 이 이벤트를 보냄) =====
+    socket.on('dmRespawn', () => {
+        const code = socket.currentRoom;
+        const room = code && rooms[code];
+        if (!room || room.mode !== 'dm') return;
+        const slot = slotOfSocket(room, socket);
+        if (slot < 0 || !room.connected[slot]) return;
+        if (!room.alive[slot] && room.diedAt[slot] && Date.now() - room.diedAt[slot] < DM_MIN_RESPAWN_MS) return;
+        room.alive[slot] = true;
+        room.hp[slot] = 100;
+        room.inv[slot] = Date.now() + DM_PROTECT_MS;
+        socket.to(code).emit('dmRespawned', { slot });
+    });
+
+    // ===== 팀 핑 (팀전에서 같은 팀 사람에게만 전달) =====
+    const PING_TYPES = new Set(['danger', 'assist', 'watch']);
+    socket.on('ping', (d) => {
+        const code = socket.currentRoom;
+        const room = code && rooms[code];
+        if (!room || room.mode !== 'team' || !room.started || !d || !PING_TYPES.has(d.type)) return;
+        const slot = slotOfSocket(room, socket);
+        if (slot < 0 || !room.alive[slot]) return;
+        const now = Date.now();
+        if (socket.lastPingAt && now - socket.lastPingAt < 800) return; // 도배 방지
+        socket.lastPingAt = now;
+        const lim = (v) => Math.max(-300, Math.min(300, nf(v)));
+        const out = { pid: slot, type: d.type, x: lim(d.x), y: lim(d.y), z: lim(d.z) };
+        room.idOfSlot.forEach((id, sl) => {
+            if (id && sl !== slot && room.connected[sl] && room.teamOfSlot[sl] === room.teamOfSlot[slot]) io.to(id).emit('ping', out);
+        });
+    });
+
+    // ===== 섬광/어둠에 맞은 사람이 "내가 맞았다"고 알림 → 다른 사람 화면에서 그 사람 머리 위에 표시 =====
+    socket.on('skillStatus', (d) => {
+        const code = socket.currentRoom;
+        const room = code && rooms[code];
+        if (!room || !d || (d.kind !== 'flash' && d.kind !== 'para')) return;
+        const slot = slotOfSocket(room, socket);
+        if (slot < 0) return;
+        const ms = Math.max(200, Math.min(6000, nf(d.ms)));
+        const by = Number(d.by);
+        const byId = Number.isInteger(by) && by >= 0 ? idOfSlotAny(room, by) : null;
+        // 던진 사람에게는 "적중" 표시용(mine: true), 나머지 사람에게는 머리 위 표시용(mine: false). 맞은 본인에게는 보내지 않음
+        const memberIds = isSlotMode(room) ? room.idOfSlot.filter(Boolean) : room.players;
+        memberIds.forEach(id => {
+            if (id === socket.id) return;
+            io.to(id).emit('skillStatus', { pid: slot, kind: d.kind, ms, mine: id === byId });
+        });
+        if (room.spectators.size) specEmit(code, room, 'specSkillStatus', { i: slot, kind: d.kind, ms });
+    });
+
+    // ===== 대시 이펙트 (다른 사람 화면에 잔상) =====
+    socket.on('skillFx', (d) => {
+        const code = socket.currentRoom;
+        const room = code && rooms[code];
+        if (!room || !d || d.kind !== 'dash') return;
+        const slot = slotOfSocket(room, socket);
+        if (isSlotMode(room) && (!room.started || !room.alive[slot])) return;
+        const out = { pid: slot, kind: 'dash', x: nf(d.x), y: nf(d.y), z: nf(d.z), dx: nf(d.dx), dz: nf(d.dz) };
+        socket.to(code).emit('skillFx', out);
     });
 
     socket.on('hit', (data) => {
@@ -1399,18 +1601,22 @@ io.on('connection', (socket) => {
         if (!room) return;
         const slot = slotOfSocket(room, socket);
         const dmg = Math.max(0, Math.min(100, Number(data && data.damage) || 0));
+        // 맞은 부위/무기도 같이 전달 (사망 정보 패널과 킬로그에 사용)
+        const part = (data && KILL_PARTS.has(data.part)) ? data.part : '';
+        const weapon = (data && KILL_WEAPONS.has(Number(data.weapon))) ? Number(data.weapon) : 0;
 
-        if (room.mode === 'team') {
-            // 팀전: 맞은 사람에게만 데미지를 전달. 같은 팀/이미 죽은 사람은 무시
+        if (isSlotMode(room)) {
+            // 팀전/데스매치: 맞은 사람에게만 데미지를 전달. 같은 팀/이미 죽은 사람은 무시
             if (!room.started || room.matchOver || !room.alive[slot]) return;
             const tSlot = Number(data && data.target);
             if (!Number.isInteger(tSlot) || tSlot < 0 || tSlot >= room.n || !room.alive[tSlot]) return;
             if (room.teamOfSlot[tSlot] === room.teamOfSlot[slot]) return;
-            io.to(room.idOfSlot[tSlot]).emit('takeDamage', { damage: dmg, from: slot });
+            if (room.mode === 'dm' && Date.now() < room.inv[tSlot]) return; // 부활 직후 무적
+            io.to(room.idOfSlot[tSlot]).emit('takeDamage', { damage: dmg, from: slot, part, weapon });
             return;
         }
 
-        socket.to(code).emit('takeDamage', data);
+        socket.to(code).emit('takeDamage', { damage: Number(data && data.damage) || 0, part, weapon });
     });
 
     socket.on('iDied', (data) => {
@@ -1419,6 +1625,21 @@ io.on('connection', (socket) => {
         if (!room) return;
         const slot = slotOfSocket(room, socket);
 
+        if (room.mode === 'dm') {
+            if (!room.alive[slot]) return;
+            room.alive[slot] = false;
+            room.hp[slot] = 0;
+            room.diedAt[slot] = Date.now();
+            let killer = Number(data && data.killer);
+            if (!Number.isInteger(killer) || killer < 0 || killer >= room.n || killer === slot || !room.connected[killer]) killer = -1;
+            room.deaths[slot] += 1;
+            if (killer >= 0) room.kills[killer] += 1;
+            io.to(code).emit('playerDied', { slot, killer });
+            emitKillFeed(code, room, killer, slot, data && data.weapon, data && data.part);
+            emitDmScores(code, room);
+            return;
+        }
+
         if (room.mode === 'team') {
             if (!room.started || room.matchOver || !room.alive[slot]) return;
             room.alive[slot] = false;
@@ -1426,12 +1647,14 @@ io.on('connection', (socket) => {
             let killer = Number(data && data.killer);
             if (!Number.isInteger(killer) || killer < 0 || killer >= room.n || room.teamOfSlot[killer] === room.teamOfSlot[slot]) killer = -1;
             io.to(code).emit('playerDied', { slot, killer });
+            emitKillFeed(code, room, killer, slot, data && data.weapon, data && data.part);
             specEmit(code, room, 'specDeath', { i: slot, killer, score: room.score });
             checkTeamRound(code, room);
             return;
         }
 
         socket.to(code).emit('enemyKilled');
+        if (slot >= 0) emitKillFeed(code, room, 1 - slot, slot, data && data.weapon, data && data.part);
         if (slot >= 0) {
             const winner = 1 - slot;
             room.hp[slot] = 0;
@@ -1465,7 +1688,7 @@ io.on('connection', (socket) => {
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
-    console.log(`Server running on port ${PORT}`);
+    console.log(`Server running on port ${PORT} (데스매치 방 ${DM_CODE} 열림)`);
     // 서버가 켜질 때 퀴즈를 미리 받아 두고 앱스크립트도 깨워둠 (첫 접속자가 느리게 기다리지 않도록)
     fetchQuizzesFromGas().catch(() => {});
 });
