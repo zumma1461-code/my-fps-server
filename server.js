@@ -19,6 +19,7 @@ process.on('uncaughtException', (e) => console.error('[uncaughtException]', e));
 // ===== 계정 API / 버전 체크 설정 =====
 // 구글 앱스크립트(Code.gs)를 웹앱으로 배포한 뒤 나오는 URL로 반드시 교체하세요.
 const ACCOUNT_API_URL = 'https://script.google.com/macros/s/AKfycby7gNM97v9keZ-Y7MUnrtvtA2SZD7fOeBzH1wsx-dd3F08rPM-_WZm44zt_ayDTUFfAkA/exec';
+const RANKED_ENABLED = false;   // 경쟁전은 일단 꺼 둠 (다시 켜려면 true)
 // 클라이언트가 이 버전이 아니면 "업데이트가 필요합니다" 안내를 보냄
 const REQUIRED_VERSION = 'Beta 1.6';
 
@@ -1132,6 +1133,7 @@ io.on('connection', (socket) => {
 
     socket.on('rankedQueue', () => {
         const stop = (message) => socket.emit('rankedQueueState', { searching: false, message });
+        if (!RANKED_ENABLED) return stop('경쟁전은 지금 사용할 수 없습니다.');
         if (!socket.username) return stop('로그인한 계정만 경쟁전을 할 수 있습니다.');
         if (socket.currentRoom || socket.spectating) return stop('방에서 나간 뒤 이용하세요.');
         // 같은 계정이 이미 다른 곳에서 대기 중이면 자기 자신과는 매칭될 수 없으므로 안내
@@ -1305,6 +1307,11 @@ io.on('connection', (socket) => {
 
         // 자기 방에 다시 들어가 혼자 게임이 시작되는 문제 방지
         if (room.players.includes(socket.id)) return;
+
+        if (room.banned && room.banned.has(socket.username || socket.id)) {
+            socket.emit('errorMsg', '이 방에서 추방되어 다시 들어갈 수 없습니다.');
+            return;
+        }
 
         if (room.mode === 'dm') { joinDeathmatch(socket, room, roomCode); return; }
 
@@ -1547,6 +1554,27 @@ io.on('connection', (socket) => {
         socket.to(code).emit('dmRespawned', { slot });
     });
 
+    // ===== 방장 추방 (일반 방/팀전 방, 친구 대결/데스매치 방 제외) =====
+    socket.on('kickPlayer', (d) => {
+        const deny = (message) => socket.emit('kickResult', { success: false, message });
+        const code = socket.currentRoom;
+        const room = code && rooms[code];
+        if (!room || room.private || room.permanent) return deny('이 방에서는 추방할 수 없습니다.');
+        if (room.host !== socket.id) return deny('방장만 추방할 수 있습니다.');
+        let targetId = null;
+        if (d && typeof d.id === 'string') targetId = d.id;
+        else if (d && d.slot !== undefined && d.slot !== null && Number.isInteger(Number(d.slot))) targetId = idOfSlotAny(room, Number(d.slot));
+        if (!targetId || targetId === socket.id || !room.players.includes(targetId)) return deny('추방할 플레이어를 찾을 수 없습니다.');
+        const target = sockById(targetId);
+        if (!target) return deny('추방할 플레이어를 찾을 수 없습니다.');
+        room.banned = room.banned || new Set();
+        room.banned.add(target.username || target.id);        // 같은 계정(비회원은 같은 접속)은 이 방에 다시 들어올 수 없음
+        target.emit('kicked', { reason: '방장에 의해 추방되었습니다.' });
+        removeFromRoom(target);
+        broadcastPresence(target.username);
+        socket.emit('kickResult', { success: true, message: `${nameOf(target)}님을 추방했습니다.` });
+    });
+
     // ===== 팀 핑 (팀전에서 같은 팀 사람에게만 전달) =====
     const PING_TYPES = new Set(['danger', 'assist', 'watch']);
     socket.on('ping', (d) => {
@@ -1559,7 +1587,8 @@ io.on('connection', (socket) => {
         if (socket.lastPingAt && now - socket.lastPingAt < 800) return; // 도배 방지
         socket.lastPingAt = now;
         const lim = (v) => Math.max(-300, Math.min(300, nf(v)));
-        const out = { pid: slot, type: d.type, x: lim(d.x), y: lim(d.y), z: lim(d.z) };
+        const unit = (v) => Math.max(-1, Math.min(1, nf(v)));
+        const out = { pid: slot, type: d.type, x: lim(d.x), y: lim(d.y), z: lim(d.z), nx: unit(d.nx), ny: unit(d.ny), nz: unit(d.nz) };
         room.idOfSlot.forEach((id, sl) => {
             if (id && sl !== slot && room.connected[sl] && room.teamOfSlot[sl] === room.teamOfSlot[slot]) io.to(id).emit('ping', out);
         });
