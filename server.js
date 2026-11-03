@@ -4,8 +4,11 @@ const { Server } = require('socket.io');
 
 const app = express();
 const server = http.createServer(app);
+// pingInterval/pingTimeout: 끊김을 빨리 알아채야 재접속 유예(15초)가 의미가 있음
 const io = new Server(server, {
-    cors: { origin: "*", methods: ["GET", "POST"] }
+    cors: { origin: "*", methods: ["GET", "POST"] },
+    pingInterval: 8000,
+    pingTimeout: 8000
 });
 
 // 상태 확인용 주소 - Render 헬스체크나 외부 핑(UptimeRobot 등)으로 서버를 깨워둘 때 사용
@@ -24,7 +27,7 @@ const RANKED_ENABLED = false;   // 경쟁전은 일단 꺼 둠 (다시 켜려면
 const REQUIRED_VERSION = 'Beta 1.6';
 
 const API_TIMEOUT_MS = 20 * 1000;                                              // 앱스크립트가 처음 깰 때 느릴 수 있어 넉넉하게
-const READ_ACTIONS = new Set(['getFriends', 'getQuizzes', 'getSettings', 'getRanked']); // 실패 시 한 번 더 시도해도 안전한 읽기 요청
+const READ_ACTIONS = new Set(['getFriends', 'getQuizzes', 'getSettings', 'getRanked', 'tokenLogin']); // 실패 시 한 번 더 시도해도 안전한 읽기 요청
 
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
@@ -809,8 +812,107 @@ function joinDeathmatch(socket, room, code) {
     broadcastPresence(socket.username);
 }
 
+// ===== 로그인 유지 / 재접속 =====
+function applyLogin(socket, name) {
+    if (socket.authToken) { // 다른 계정으로 바꿔 로그인하면 이전 토큰은 폐기
+        callAccountApi({ action: 'revokeToken', token: socket.authToken }).catch(() => {});
+        socket.authToken = null;
+    }
+    clearUserSession(socket);
+    socket.username = name;
+    onlineUsers.set(name, socket);
+    broadcastPresence(name);
+    loadFriendSet(socket);
+}
+
+// 로그인 응답을 먼저 보낸 뒤 뒤에서 토큰을 발급해 따로 전달 (로그인이 느려지지 않도록)
+async function issueToken(socket, name, remember) {
+    try {
+        const t = await callAccountApi({ action: 'createToken', username: name, remember: !!remember });
+        if (!t || !t.success || !t.token) return;
+        if (socket.username !== name) { // 그 사이 로그아웃했거나 다른 계정으로 바뀐 경우
+            callAccountApi({ action: 'revokeToken', token: t.token }).catch(() => {});
+            return;
+        }
+        socket.authToken = t.token;
+        socket.emit('sessionToken', { token: t.token, remember: !!remember });
+    } catch (e) { /* 발급에 실패해도 로그인은 유지됨 */ }
+}
+
+// invalid: true = 토큰이 없거나 만료 (지워야 함) / false = 계정 서버 문제 (토큰은 남겨 둠)
+async function loginByToken(socket, token) {
+    token = String(token == null ? '' : token).slice(0, 200);
+    if (!token) return { ok: false, invalid: true };
+    try {
+        const r = await callAccountApi({ action: 'tokenLogin', token });
+        if (r && r.success && r.username) {
+            applyLogin(socket, String(r.username).trim());
+            socket.authToken = token;
+            return { ok: true, result: r };
+        }
+        return { ok: false, invalid: !!(r && r.tokenInvalid) };
+    } catch (e) {
+        return { ok: false, invalid: false };
+    }
+}
+
+// 경기 중 연결이 끊기면 바로 내보내지 않고 자리를 잠시 비워 둠
+const RECONNECT_GRACE_MS = 15 * 1000;
+const pendingRejoin = new Map(); // 접속 키 -> { code, room, oldId, socket, timer }
+
+function holdForRejoin(socket) {
+    const code = socket.currentRoom;
+    const room = code && rooms[code];
+    const key = socket.rejoinKey;
+    if (!key || !room || !room.started || room.matchOver || room.mode === 'dm') return false;
+    if (!room.players.includes(socket.id)) return false;
+    if (room.mode === '1v1' && room.players.length < 2) return false;
+
+    const prev = pendingRejoin.get(key);
+    if (prev) clearTimeout(prev.timer);
+    const entry = { code, room, oldId: socket.id, socket };
+    entry.timer = setTimeout(() => {
+        if (pendingRejoin.get(key) !== entry) return;
+        pendingRejoin.delete(key);
+        if (rooms[code] === room) removeFromRoom(socket); // 시간 안에 못 돌아오면 원래대로 퇴장 처리
+    }, RECONNECT_GRACE_MS);
+    pendingRejoin.set(key, entry);
+    io.to(code).emit('peerOffline', { slot: slotOfSocket(room, socket), graceMs: RECONNECT_GRACE_MS });
+    return true;
+}
+
+// 새 연결(socket)이 옛 연결의 자리를 이어받음. 방 안에서 소켓 id로 보관하던 값을 전부 새 id로 교체
+function rejoinNow(socket) {
+    const key = socket.rejoinKey;
+    const entry = key && pendingRejoin.get(key);
+    if (!entry) return false;
+    clearTimeout(entry.timer);
+    pendingRejoin.delete(key);
+
+    const { code, room, oldId } = entry;
+    const fail = () => { if (rooms[code] === room) removeFromRoom(entry.socket); return false; };
+    if (rooms[code] !== room || !room.started || room.matchOver) return fail();
+    if (room.mode === '1v1' && room.players.length < 2) return fail(); // 그 사이 상대가 나감
+
+    const swap = (id) => (id === oldId ? socket.id : id);
+    room.players = room.players.map(swap);
+    if (room.host === oldId) room.host = socket.id;
+    room.idOfSlot = room.idOfSlot.map(swap);
+    ['slotOf', 'teamOf', 'skillOf', 'rankedNames'].forEach(k => {
+        const m = room[k];
+        if (m && m[oldId] !== undefined) { m[socket.id] = m[oldId]; delete m[oldId]; }
+    });
+    socket.join(code);
+    socket.currentRoom = code;
+    io.to(code).emit('peerOnline', { slot: slotOfSocket(room, socket) });
+    return true;
+}
+
 io.on('connection', (socket) => {
     socket.guestName = '손님' + Math.floor(100 + Math.random() * 900); // 로그인하지 않은 사람의 방 안 표시 이름
+    // 재접속 키: 클라이언트가 페이지를 열 때 만든 랜덤 값 (끊겼다 다시 붙어도 같은 값)
+    const authKey = socket.handshake && socket.handshake.auth && socket.handshake.auth.key;
+    socket.rejoinKey = authKey ? String(authKey).slice(0, 64) : null;
     // 연결 시 현재 방 목록 전송
     socket.emit('updateRoomList', getPublicRoomList());
 
@@ -859,11 +961,12 @@ io.on('connection', (socket) => {
         try {
             const result = await callAccountApi({ action: 'login', username: data.username, password: data.password });
             if (result.success) {
-                clearUserSession(socket); // 같은 소켓으로 다른 계정에 다시 로그인하는 경우 이전 계정 정리
-                socket.username = String(data.username).trim(); // 이후 방/게임 로직 및 친구 기능에 사용
-                onlineUsers.set(socket.username, socket);
-                broadcastPresence(socket.username); // 친구들에게 온라인 알림
-                loadFriendSet(socket);              // 내 친구 집합은 비동기로 불러옴 (이어서 오는 getFriends 요청과 호출이 합쳐짐)
+                const name = String(data.username).trim();
+                applyLogin(socket, name); // 이후 방/게임 로직 및 친구 기능에 사용
+                result.username = name;
+                socket.emit('loginResult', result);
+                issueToken(socket, name, !!data.remember); // 로그인 유지용 토큰은 응답을 기다리지 않고 뒤에서 발급
+                return;
             }
             socket.emit('loginResult', result);
         } catch (err) {
@@ -871,9 +974,38 @@ io.on('connection', (socket) => {
         }
     });
 
-    // 로그아웃 - 온라인 목록에서 빼고 대기 중인 대결 신청을 정리
+    // 저장된 토큰으로 자동 로그인 (페이지를 열었을 때)
+    socket.on('tokenLogin', async (data) => {
+        const token = data && data.token;
+        const r = await loginByToken(socket, token);
+        if (r.ok) {
+            socket.emit('loginResult', Object.assign({}, r.result, { token: String(token) }));
+        } else {
+            socket.emit('loginResult', {
+                success: false,
+                tokenInvalid: r.invalid,
+                message: r.invalid ? '자동 로그인이 만료되었습니다. 다시 로그인해주세요.' : '계정 서버 연결 실패. 새로고침하거나 직접 로그인해주세요.'
+            });
+        }
+    });
+
+    // 연결이 끊겼다 다시 붙었을 때: 방 복귀(시간이 중요하므로 먼저) → 로그인 복구
+    socket.on('resume', async (data) => {
+        const rejoined = rejoinNow(socket);
+        let loggedIn = !!socket.username;
+        if (!loggedIn && data && data.token) {
+            const r = await loginByToken(socket, data.token);
+            loggedIn = r.ok;
+        }
+        socket.emit('resumeResult', { loggedIn, rejoined, code: rejoined ? socket.currentRoom : null });
+    });
+
+    // 로그아웃 - 온라인 목록에서 빼고 대기 중인 대결 신청을 정리, 로그인 유지 토큰도 폐기
     socket.on('logout', () => {
+        const t = socket.authToken;
+        socket.authToken = null;
         clearUserSession(socket);
+        if (t) callAccountApi({ action: 'revokeToken', token: t }).catch(() => {});
     });
 
     // 비밀번호 변경 요청 처리 - 로그인한 사용자만 가능
@@ -1710,8 +1842,9 @@ io.on('connection', (socket) => {
     // 접속 해제 처리
     socket.on('disconnect', () => {
         stopSpectating(socket);
+        const held = holdForRejoin(socket); // 경기 중이면 15초 동안 자리를 비워 둠
         clearUserSession(socket);
-        removeFromRoom(socket);
+        if (!held) removeFromRoom(socket);
     });
 });
 
