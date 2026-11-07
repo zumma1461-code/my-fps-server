@@ -24,7 +24,7 @@ process.on('uncaughtException', (e) => console.error('[uncaughtException]', e));
 const ACCOUNT_API_URL = 'https://script.google.com/macros/s/AKfycby7gNM97v9keZ-Y7MUnrtvtA2SZD7fOeBzH1wsx-dd3F08rPM-_WZm44zt_ayDTUFfAkA/exec';
 const RANKED_ENABLED = false;   // 경쟁전은 일단 꺼 둠 (다시 켜려면 true)
 // 클라이언트가 이 버전이 아니면 "업데이트가 필요합니다" 안내를 보냄
-const REQUIRED_VERSION = 'Beta 1.6';
+const REQUIRED_VERSION = 'Beta 1.7';
 
 const API_TIMEOUT_MS = 20 * 1000;                                              // 앱스크립트가 처음 깰 때 느릴 수 있어 넉넉하게
 const READ_ACTIONS = new Set(['getFriends', 'getQuizzes', 'getSettings', 'getRanked', 'tokenLogin']); // 실패 시 한 번 더 시도해도 안전한 읽기 요청
@@ -277,13 +277,143 @@ const nf = (v) => (Number.isFinite(Number(v)) ? Number(v) : 0);
 // ===== 방 / 팀전 설정 =====
 const TEAM_MAX = 5;     // 팀전은 한 팀당 최대 5명
 const WIN_SCORE = 5;    // 먼저 5라운드를 이기면 승리
+// 거의 동시에 서로 쓰러뜨렸을 때(맞교환)를 가리는 시간. 이 안에 둘 다 쓰러지면 무승부로 처리하고,
+// 점수는 서버가 한 번만 정해서 모두에게 똑같이 알려줌
+const TRADE_WINDOW_MS = 220;
 
 // ===== 데스매치 (서버가 켜져 있는 동안 항상 열려 있는 방) =====
 const DM_CODE = 'DM1';
 const DM_MAX = 10;                 // 동시에 들어올 수 있는 최대 인원
 const DM_MIN_RESPAWN_MS = 2000;    // 죽은 뒤 이 시간이 지나야 부활 요청이 받아들여짐
-const DM_PROTECT_MS = 2500;        // 부활 직후 무적 시간
+const DM_PROTECT_MS = 3000;        // 부활 직후 무적 시간 (먼저 사격하면 바로 풀림)
+const HEAL_TOTAL = 35, HEAL_MS = 3000, HEAL_LOCK_MS = 2000, HEAL_COOLDOWN_MS = 8000; // 응급 처치 (데스매치에서는 서버가 체력을 직접 관리)
 const isSlotMode = (room) => !!room && (room.mode === 'team' || room.mode === 'dm'); // 플레이어마다 고정 번호(슬롯)를 쓰는 방
+
+// ===== 데스매치 맵 (서버가 정의하고 접속할 때 클라이언트에 보냄 - 스폰 안전 판정에도 같은 데이터를 씀) =====
+// 십자 광장 "지구라트 요새": 가운데 3단 지구라트, 사분면마다 컨테이너 야적장,
+// 네 모서리의 코너 벙커와 네 변의 측면 격납고가 스폰 방이며 입구가 중앙을 향하지 않고 가림벽이 시선을 막음
+const DM_HALF = 40;                                                      // 맵 반지름 (가로 80 x 세로 80)
+const DM_T = { wall: 0, cover: 1, low: 2, step: 3, tier: 4, cargo: 5 };  // 종류 번호 (클라이언트가 색을 정함)
+const DM_BOXES = [];                                                     // [x, z, 가로, 세로, 높이, 종류]
+const DM_SPAWNS = [];                                                    // { x, z, yaw }
+function dmBox(x, z, w, d, h, t) { DM_BOXES.push([x, z, w, d, h, DM_T[t]]); }
+function dm4(x, z, w, d, h, t) { [[x, z], [-x, z], [x, -z], [-x, -z]].forEach(p => dmBox(p[0], p[1], w, d, h, t)); }
+function dmRot(x, z, w, d, h, t) { dmBox(x, z, w, d, h, t); dmBox(-z, x, d, w, h, t); dmBox(-x, -z, w, d, h, t); dmBox(z, -x, d, w, h, t); } // 90도씩 돌려 4번
+function dmSpawnRot(x, z, lx, lz) { // (x,z)에서 (lx,lz)를 바라보는 스폰을 4방향으로
+    const rot = (px, pz, k) => { for (let i = 0; i < k; i++) { const t = px; px = -pz; pz = t; } return [px, pz]; };
+    for (let k = 0; k < 4; k++) {
+        const p = rot(x, z, k), l = rot(lx, lz, k);
+        DM_SPAWNS.push({ x: p[0], z: p[1], yaw: Math.atan2(p[0] - l[0], p[1] - l[1]) });
+    }
+}
+(function buildDmData() {
+    // 중앙 지구라트: 3단, 점프로 한 단씩 오름. 꼭대기는 잘 보이지만 사방이 노출됨
+    dmBox(0, 0, 18, 18, 0.9, 'tier');
+    dmBox(0, 0, 12, 12, 1.8, 'tier');
+    dmBox(0, 0, 6, 6, 2.7, 'tier');
+    dm4(7.6, 7.6, 1.6, 1.6, 2.8, 'cover');          // 1단 모서리 기둥
+    // 지구라트 둘레: ㄱ자 낮은 벽 (뛰어넘거나 엄폐). 십자 길은 열어 둠
+    dm4(15, 8.5, 1, 9, 1.2, 'low');
+    dm4(8.5, 15, 9, 1, 1.2, 'low');
+    // 컨테이너 야적장: 사분면마다 2개 + 컨테이너 위로 오르는 상자
+    dm4(22, 12, 9, 2.6, 2.1, 'cargo');
+    dm4(12, 22, 2.6, 9, 2.1, 'cargo');
+    dm4(22, 9.2, 3, 3, 0.9, 'step');
+    dm4(9.2, 22, 3, 3, 0.9, 'step');
+    // 코너 벙커 (스폰 방): 입구(z 28~31)는 중앙을 향하지 않고, 가림벽이 바깥 시선을 막음
+    dm4(33.75, 27.5, 12.5, 1, 3.2, 'wall');
+    dm4(27.5, 35.5, 1, 9, 3.2, 'wall');
+    dm4(24, 27.5, 1.5, 6, 3.0, 'wall');
+    // 측면 격납고 (스폰 방): 가운데 가림벽
+    dmRot(33.75, 6, 12.5, 1, 3.2, 'wall');
+    dmRot(33.75, -6, 12.5, 1, 3.2, 'wall');
+    dmRot(31, -1.25, 1, 9.5, 3.2, 'wall');
+    // 바깥 지대 엄폐물
+    dmRot(32, 16, 3, 3, 2.2, 'cover');
+    dmRot(32, -16, 3, 3, 2.2, 'cover');
+    dm4(19, 31, 6, 1, 1.2, 'low');
+    dm4(31, 19, 1, 6, 1.2, 'low');
+    // 스폰 지점 (모두 스폰 방 안쪽 깊은 곳)
+    dmSpawnRot(35, 35, 27.5, 29.5);
+    dmSpawnRot(37, 31.5, 27.5, 29.5);
+    dmSpawnRot(37, -3, 27.5, 0);
+    dmSpawnRot(37, 3.5, 27.5, 0);
+})();
+
+// 눈높이(1.6)를 가리는 높은 상자만 시선을 막음 (낮은 벽은 넘어서 볼 수 있음)
+const DM_BLOCKERS = DM_BOXES.filter(b => b[4] >= 1.6).map(b => ({ minX: b[0] - b[2] / 2, maxX: b[0] + b[2] / 2, minZ: b[1] - b[3] / 2, maxZ: b[1] + b[3] / 2 }));
+function segHitsBox(ax, az, bx, bz, b) {
+    let t0 = 0, t1 = 1;
+    const dx = bx - ax, dz = bz - az;
+    const tests = [[-dx, ax - b.minX], [dx, b.maxX - ax], [-dz, az - b.minZ], [dz, b.maxZ - az]];
+    for (let i = 0; i < 4; i++) {
+        const p = tests[i][0], q = tests[i][1];
+        if (p === 0) { if (q < 0) return false; }
+        else {
+            const r = q / p;
+            if (p < 0) { if (r > t1) return false; if (r > t0) t0 = r; }
+            else { if (r < t0) return false; if (r < t1) t1 = r; }
+        }
+    }
+    return true;
+}
+function dmHasLOS(ax, az, bx, bz) {
+    for (let i = 0; i < DM_BLOCKERS.length; i++) if (segHitsBox(ax, az, bx, bz, DM_BLOCKERS[i])) return false;
+    return true;
+}
+
+// 부활 위치: 적에게 보이지 않고 적에게서 먼 스폰을 고름. 방금 쓴 스폰은 피해서 같은 곳에서 반복해서 당하지 않게 함
+function dmPickSpawn(room, slot) {
+    const now = Date.now();
+    const foes = [];
+    for (let s = 0; s < room.n; s++) {
+        if (s === slot || !room.connected[s] || !room.alive[s] || !room.last[s]) continue;
+        foes.push(room.last[s]);
+    }
+    let best = 0, bestScore = -1e9;
+    DM_SPAWNS.forEach((sp, i) => {
+        let minD = 999, seen = false;
+        foes.forEach(f => {
+            const d = Math.hypot(f.x - sp.x, f.z - sp.z);
+            if (d < minD) minD = d;
+            if (d < 60 && dmHasLOS(sp.x, sp.z, f.x, f.z)) seen = true;
+        });
+        let score = Math.min(minD, 60) + Math.random() * 8;
+        if (seen) score -= 120;
+        if (minD < 12) score -= 120;
+        if (now - (room.spawnUsed[i] || 0) < 12000) score -= 30;
+        if (score > bestScore) { bestScore = score; best = i; }
+    });
+    room.spawnUsed[best] = now;
+    return DM_SPAWNS[best];
+}
+
+// 응급 처치: 서버가 시간에 맞춰 체력을 올려 줌 (맞을 때/부활할 때 한꺼번에 계산)
+function dmApplyHeal(room, slot, now) {
+    const h = room.heal[slot];
+    if (!h) return;
+    const t = Math.min(now, h.end);
+    h.acc += (t - h.last) * HEAL_TOTAL / HEAL_MS;
+    h.last = t;
+    const whole = Math.floor(h.acc);
+    if (whole > 0) { h.acc -= whole; room.hp[slot] = Math.min(100, room.hp[slot] + whole); }
+    if (now >= h.end || room.hp[slot] >= 100) room.heal[slot] = null;
+}
+
+// 데스매치에서 죽음 처리 - 체력은 서버가 정하므로 죽었는지도 서버가 정함 (피해 신호를 놓쳐도 확실히 죽음)
+function dmKill(code, room, victim, killer, weapon, part) {
+    if (!room.alive[victim]) return;
+    room.alive[victim] = false;
+    room.hp[victim] = 0;
+    room.heal[victim] = null;
+    room.inv[victim] = 0;
+    room.diedAt[victim] = Date.now();
+    room.deaths[victim] += 1;
+    if (killer >= 0 && killer !== victim && room.connected[killer]) room.kills[killer] += 1; else killer = -1;
+    io.to(code).emit('playerDied', { slot: victim, killer });
+    emitKillFeed(code, room, killer, victim, weapon, part);
+    emitDmScores(code, room);
+}
 
 const sockById = (id) => io.sockets.sockets.get(id);
 function nameOf(sock) { return (sock && (sock.username || sock.guestName)) || '손님'; }
@@ -324,6 +454,8 @@ function makeRoom(name, players, isPrivate, opts) {
         teamOf: {},                // (팀전) 소켓 id -> 0 | 1
         slotOf: {}, idOfSlot: [], teamOfSlot: [], nameOfSlot: [], idxOfSlot: [], connected: [], alive: [], n: 2,
         roundEnded: false, matchOver: false, roundTimer: null,
+        deadInRound: [false, false], // (1대1) 이번 라운드에 쓰러진 사람
+        tradeTimer: null,          // 맞교환 판정을 기다리는 타이머
         spectators: new Set(),     // 관전 중인 소켓 id
         last: [null, null],        // 플레이어(슬롯)별 마지막 위치 (늦게 들어온 관전자에게 바로 보여주기 위함)
         weapon: [1, 1],
@@ -446,7 +578,7 @@ function cancelInvitesForRoom(code) {
 
 // ===== 스킬(캐릭터) 선택 단계 =====
 // 경기가 시작되면 모든 플레이어가 스킬을 하나씩 골라야 첫 라운드가 시작됨. 30초 안에 못 고르면 대시로 자동 선택.
-const SKILL_KEYS = new Set(['dash', 'para', 'grenade']);
+const SKILL_KEYS = new Set(['dash', 'para', 'grenade', 'heal', 'scan']);
 const SKILL_PICK_MS = 30 * 1000;
 
 function beginSkillPhase(code, room) {
@@ -607,12 +739,68 @@ function tryRankedMatch() {
     rankedQueue.forEach(s => s.emit('rankedQueueState', { searching: true, waiting: rankedQueue.length }));
 }
 
+// ===== (1대1) 라운드 판정 - 서버가 한 번만 정하고 두 사람에게 똑같은 점수를 보냄 =====
+// 한 명이 쓰러지면 TRADE_WINDOW_MS 동안 기다려서 상대도 쓰러졌는지 확인함. 둘 다 쓰러졌으면 무승부(점수 없음)
+function resolveDuelRound(code, room) {
+    room.tradeTimer = null;
+    if (rooms[code] !== room || room.matchOver) return;
+    const dead = room.deadInRound.slice();
+    room.deadInRound = [false, false];
+    if (!dead[0] && !dead[1]) return;
+
+    let winner = -1;
+    if (dead[0] && !dead[1]) winner = 1;
+    else if (dead[1] && !dead[0]) winner = 0;
+    if (winner >= 0) room.score[winner] += 1;
+    const over = winner >= 0 && room.score[winner] >= WIN_SCORE;
+
+    [0, 1].forEach(i => {
+        const id = room.players[i];
+        if (id) io.to(id).emit('roundResult', { win: winner < 0 ? null : winner === i, my: room.score[i], enemy: room.score[1 - i], over });
+    });
+    [0, 1].forEach(i => { if (dead[i]) { room.hp[i] = 0; specEmit(code, room, 'specDeath', { i, score: room.score }); } });
+
+    clearTimeout(room.resetTimer);
+    if (over) {
+        room.matchOver = true;
+        specEmit(code, room, 'specMatchEnd', { winner, score: room.score });
+        // [1.6] 경쟁전: 마지막 라운드가 끝나면 바로 결과를 기록
+        if (room.ranked && room.players[winner] && room.players[1 - winner]) {
+            settleRanked(room, room.players[winner], room.players[1 - winner], null);
+        }
+    } else {
+        // 라운드가 다시 시작되는 시점(클라이언트가 약 1.5초 뒤 시작)에 체력을 되돌림
+        room.resetTimer = setTimeout(() => {
+            if (rooms[code] !== room) return;
+            room.hp = [100, 100];
+            specEmit(code, room, 'specRound', { hp: room.hp });
+        }, 1600);
+    }
+}
+
 // ===== (팀전) 라운드 / 경기 진행 - 서버가 판정함 =====
 // 한 팀이 전멸하면 상대 팀이 라운드 승리. 먼저 WIN_SCORE 라운드를 이기면 경기 종료
-function checkTeamRound(code, room) {
-    if (!room.started || room.roundEnded || room.matchOver) return;
+// 마지막 사람들이 거의 동시에 쓰러지면 무승부가 되도록, 전멸을 확인한 뒤 잠깐(TRADE_WINDOW_MS) 기다렸다가 판정함
+function teamAliveCount(room) {
     const aliveCnt = [0, 0];
     for (let sl = 0; sl < room.n; sl++) if (room.alive[sl]) aliveCnt[room.teamOfSlot[sl]]++;
+    return aliveCnt;
+}
+
+function checkTeamRound(code, room) {
+    if (!room.started || room.roundEnded || room.matchOver) return;
+    const aliveCnt = teamAliveCount(room);
+    if (aliveCnt[0] > 0 && aliveCnt[1] > 0) return;
+    if (room.tradeTimer) return; // 이미 판정을 기다리는 중
+    room.tradeTimer = setTimeout(() => {
+        room.tradeTimer = null;
+        if (rooms[code] === room) finalizeTeamRound(code, room);
+    }, TRADE_WINDOW_MS);
+}
+
+function finalizeTeamRound(code, room) {
+    if (!room.started || room.roundEnded || room.matchOver) return;
+    const aliveCnt = teamAliveCount(room);
     if (aliveCnt[0] > 0 && aliveCnt[1] > 0) return;
 
     room.roundEnded = true;
@@ -642,6 +830,8 @@ function startTeamRound(code, room) {
 
 function endTeamMatch(code, room, winner, forfeit) {
     if (room.matchOver) return;
+    clearTimeout(room.tradeTimer);
+    room.tradeTimer = null;
     room.matchOver = true;
     room.roundEnded = true;
     io.to(code).emit('teamMatchEnd', { winner, scores: room.score, forfeit: !!forfeit });
@@ -655,6 +845,8 @@ function teamBackToLobby(code, room) {
     if (rooms[code] !== room) return;
     clearTimeout(room.roundTimer);
     clearTimeout(room.skillTimer);
+    clearTimeout(room.tradeTimer);
+    room.tradeTimer = null;
     room.skillPhase = false;
     room.started = false;
     room.matchOver = false;
@@ -701,6 +893,8 @@ function removeFromRoom(socket) {
             room.idOfSlot[slot] = null;
             room.nameOfSlot[slot] = '';
             room.last[slot] = null;
+            room.heal[slot] = null;
+            room.inv[slot] = 0;
             delete room.slotOf[socket.id];
             io.to(code).emit('teamPlayerLeft', { slot });
             emitDmScores(code, room);
@@ -713,6 +907,7 @@ function removeFromRoom(socket) {
         if (room.players.length === 0) {
             clearTimeout(room.roundTimer);
             clearTimeout(room.skillTimer);
+            clearTimeout(room.tradeTimer);
             cancelInvitesForRoom(code);
             endRoomSpectators(code, room, '방이 사라졌습니다.');
             delete rooms[code];
@@ -743,6 +938,8 @@ function removeFromRoom(socket) {
 
     cancelInvitesForRoom(code);
     endRoomSpectators(code, room, '플레이어가 나가서 경기가 끝났습니다.');
+    clearTimeout(room.tradeTimer);
+    room.tradeTimer = null;
     if (room.players.length === 0) {
         clearTimeout(room.skillTimer);
         delete rooms[code];
@@ -771,8 +968,14 @@ function createDeathmatchRoom() {
     r.last = Array(DM_MAX).fill(null);
     r.kills = Array(DM_MAX).fill(0);
     r.deaths = Array(DM_MAX).fill(0);
-    r.inv = Array(DM_MAX).fill(0);       // 이 시각까지 무적
+    r.inv = Array(DM_MAX).fill(0);           // 이 시각까지 무적
     r.diedAt = Array(DM_MAX).fill(0);
+    r.heal = Array(DM_MAX).fill(null);       // 응급 처치 진행 상태
+    r.lastDmgAt = Array(DM_MAX).fill(0);
+    r.lastHealAt = Array(DM_MAX).fill(0);
+    r.spawnedAt = Array(DM_MAX).fill(0);
+    r.spawnPos = Array(DM_MAX).fill(null);   // 마지막으로 정해 준 스폰 (응답을 놓쳤을 때 다시 알려줌)
+    r.spawnUsed = [];                        // 스폰 번호 -> 마지막으로 쓴 시각
     rooms[DM_CODE] = r;
 }
 createDeathmatchRoom();
@@ -799,13 +1002,23 @@ function joinDeathmatch(socket, room, code) {
     room.kills[slot] = 0;
     room.deaths[slot] = 0;
     room.inv[slot] = 0;
+    room.diedAt[slot] = 0;      // 이전에 이 자리를 쓰던 사람의 기록이 남아 첫 부활이 막히지 않게
+    room.heal[slot] = null;
+    room.lastDmgAt[slot] = 0;
+    room.lastHealAt[slot] = 0;
+    room.spawnedAt[slot] = 0;
+    room.spawnPos[slot] = null;
     room.last[slot] = null;
 
+    // 지금 살아 있는지도 같이 보내서, 새로 들어온 사람 화면에서 이미 죽은 사람이 서 있는 것처럼 보이지 않게 함
     const players = [];
     for (let sl = 0; sl < DM_MAX; sl++) {
-        if (room.connected[sl]) players.push({ slot: sl, name: room.nameOfSlot[sl], k: room.kills[sl], d: room.deaths[sl] });
+        if (room.connected[sl]) players.push({ slot: sl, name: room.nameOfSlot[sl], k: room.kills[sl], d: room.deaths[sl], alive: !!room.alive[sl] });
     }
-    socket.emit('dmStart', { code, name: room.name, you: { slot }, players });
+    socket.emit('dmStart', {
+        code, name: room.name, you: { slot }, players,
+        map: { half: DM_HALF, boxes: DM_BOXES, spawns: DM_SPAWNS.map(s => [s.x, s.z]) }
+    });
     socket.to(code).emit('dmPlayerJoined', { slot, name: room.nameOfSlot[slot] });
     emitDmScores(code, room);
     broadcastRoomList();
@@ -913,6 +1126,7 @@ io.on('connection', (socket) => {
     // 재접속 키: 클라이언트가 페이지를 열 때 만든 랜덤 값 (끊겼다 다시 붙어도 같은 값)
     const authKey = socket.handshake && socket.handshake.auth && socket.handshake.auth.key;
     socket.rejoinKey = authKey ? String(authKey).slice(0, 64) : null;
+    socket.on('hello', (d) => { if (d && d.key) socket.rejoinKey = String(d.key).slice(0, 64); });
     // 연결 시 현재 방 목록 전송
     socket.emit('updateRoomList', getPublicRoomList());
 
@@ -1546,6 +1760,8 @@ io.on('connection', (socket) => {
         room.matchOver = false;
         room.roundEnded = false;
         clearTimeout(room.roundTimer);
+        clearTimeout(room.tradeTimer);
+        room.tradeTimer = null;
         cancelInvitesForRoom(code);
         beginSkillPhase(code, room); // 모두 스킬을 골라야 첫 라운드가 시작됨
 
@@ -1626,6 +1842,11 @@ io.on('connection', (socket) => {
         if (!room) return;
         const slot = slotOfSocket(room, socket);
         if (isSlotMode(room) && (!room.started || !room.alive[slot])) return;
+        // 데스매치: 부활 보호 중에 먼저 사격하면 보호가 바로 풀림 (보호를 믿고 일방적으로 쏘지 못하게)
+        if (room.mode === 'dm' && slot >= 0 && room.inv[slot] > Date.now()) {
+            room.inv[slot] = 0;
+            io.to(code).emit('dmShield', { slot, off: true });
+        }
         socket.to(code).emit('enemyFired', Object.assign({}, data, { pid: slot }));
         if (slot >= 0) specEmit(code, room, 'specFire', { i: slot, weapon: data && data.weapon, mode: data && data.mode });
     });
@@ -1660,10 +1881,11 @@ io.on('connection', (socket) => {
     });
 
     // ===== [1.6] 내 체력 보고 - 관전자 화면의 체력 표시는 맞은 본인이 알려주는 값을 그대로 사용 =====
+    // (데스매치는 서버가 체력을 직접 관리하므로 클라이언트가 보고하는 값은 받지 않음)
     socket.on('myHp', (d) => {
         const code = socket.currentRoom;
         const room = code && rooms[code];
-        if (!room) return;
+        if (!room || room.mode === 'dm') return;
         const slot = slotOfSocket(room, socket);
         if (slot < 0 || slot >= room.hp.length) return;
         if (isSlotMode(room) && !room.started) return;
@@ -1672,18 +1894,35 @@ io.on('connection', (socket) => {
         specEmit(code, room, 'specHp', { i: slot, hp });
     });
 
-    // ===== 데스매치 부활 (죽은 뒤 일정 시간이 지나야 받아들여짐. 처음 스폰할 때도 이 이벤트를 보냄) =====
+    // ===== 데스매치 부활 =====
+    // 죽은 뒤 일정 시간이 지나야 받아들여지고(처음 입장할 때는 바로), 위치는 서버가 안전한 스폰으로 정해서 알려줌.
+    // 응답을 못 받았을 때를 대비해 같은 요청이 다시 오면 방금 정해 준 위치를 다시 알려줌
     socket.on('dmRespawn', () => {
         const code = socket.currentRoom;
         const room = code && rooms[code];
         if (!room || room.mode !== 'dm') return;
         const slot = slotOfSocket(room, socket);
         if (slot < 0 || !room.connected[slot]) return;
-        if (!room.alive[slot] && room.diedAt[slot] && Date.now() - room.diedAt[slot] < DM_MIN_RESPAWN_MS) return;
+        const now = Date.now();
+        if (room.alive[slot]) {
+            const sp = room.spawnPos[slot];
+            if (sp && now - room.spawnedAt[slot] < 6000) {
+                socket.emit('dmSpawnAt', { x: sp.x, z: sp.z, yaw: sp.yaw, protectMs: Math.max(0, room.inv[slot] - now) });
+            }
+            return;
+        }
+        if (room.diedAt[slot] && now - room.diedAt[slot] < DM_MIN_RESPAWN_MS) return;
+
+        const sp = dmPickSpawn(room, slot);
         room.alive[slot] = true;
         room.hp[slot] = 100;
-        room.inv[slot] = Date.now() + DM_PROTECT_MS;
-        socket.to(code).emit('dmRespawned', { slot });
+        room.heal[slot] = null;
+        room.inv[slot] = now + DM_PROTECT_MS;
+        room.spawnedAt[slot] = now;
+        room.spawnPos[slot] = sp;
+        room.last[slot] = { x: sp.x, y: 1.6, z: sp.z, yaw: sp.yaw, pitch: 0 };
+        socket.emit('dmSpawnAt', { x: sp.x, z: sp.z, yaw: sp.yaw, protectMs: DM_PROTECT_MS });
+        socket.to(code).emit('dmRespawned', { slot, protectMs: DM_PROTECT_MS });
     });
 
     // ===== 방장 추방 (일반 방/팀전 방, 친구 대결/데스매치 방 제외) =====
@@ -1745,14 +1984,26 @@ io.on('connection', (socket) => {
         if (room.spectators.size) specEmit(code, room, 'specSkillStatus', { i: slot, kind: d.kind, ms });
     });
 
-    // ===== 대시 이펙트 (다른 사람 화면에 잔상) =====
+    // ===== 스킬 이펙트 (대시 잔상 / 스캔 파동 / 응급 처치 빛 - 다른 사람 화면에 표시) =====
+    const FX_KINDS = new Set(['dash', 'scan', 'heal']);
     socket.on('skillFx', (d) => {
         const code = socket.currentRoom;
         const room = code && rooms[code];
-        if (!room || !d || d.kind !== 'dash') return;
+        if (!room || !d || !FX_KINDS.has(d.kind)) return;
         const slot = slotOfSocket(room, socket);
         if (isSlotMode(room) && (!room.started || !room.alive[slot])) return;
-        const out = { pid: slot, kind: 'dash', x: nf(d.x), y: nf(d.y), z: nf(d.z), dx: nf(d.dx), dz: nf(d.dz) };
+        const now = Date.now();
+        if (socket.lastFxAt && now - socket.lastFxAt < 150) return; // 도배 방지
+        socket.lastFxAt = now;
+        // 데스매치: 응급 처치는 서버가 시간에 맞춰 체력을 올려 줌 (맞으면 끊김, 피해를 입은 직후와 연속 사용은 불가)
+        if (room.mode === 'dm' && d.kind === 'heal' && slot >= 0) {
+            dmApplyHeal(room, slot, now);
+            if (room.hp[slot] < 100 && now - room.lastDmgAt[slot] >= HEAL_LOCK_MS && now - room.lastHealAt[slot] >= HEAL_COOLDOWN_MS) {
+                room.heal[slot] = { last: now, end: now + HEAL_MS, acc: 0 };
+                room.lastHealAt[slot] = now;
+            }
+        }
+        const out = { pid: slot, kind: d.kind, x: nf(d.x), y: nf(d.y), z: nf(d.z), dx: nf(d.dx), dz: nf(d.dz) };
         socket.to(code).emit('skillFx', out);
     });
 
@@ -1766,13 +2017,29 @@ io.on('connection', (socket) => {
         const part = (data && KILL_PARTS.has(data.part)) ? data.part : '';
         const weapon = (data && KILL_WEAPONS.has(Number(data.weapon))) ? Number(data.weapon) : 0;
 
+        if (room.mode === 'dm') {
+            // 데스매치: 체력은 서버가 관리함. 몇 대를 맞았는지, 죽었는지를 서버가 정해서 맞은 사람에게 알려줌
+            if (!room.started || !room.alive[slot]) return;
+            const tSlot = Number(data && data.target);
+            if (!Number.isInteger(tSlot) || tSlot < 0 || tSlot >= room.n || tSlot === slot || !room.alive[tSlot]) return;
+            const now = Date.now();
+            if (now < room.inv[tSlot]) return; // 부활 직후 보호 (화면에 보호막이 보임)
+            dmApplyHeal(room, tSlot, now);
+            room.heal[tSlot] = null;           // 맞으면 응급 처치가 끊김
+            room.lastDmgAt[tSlot] = now;
+            room.hp[tSlot] = Math.max(0, room.hp[tSlot] - dmg);
+            const targetId = room.idOfSlot[tSlot];
+            if (targetId) io.to(targetId).emit('takeDamage', { damage: dmg, from: slot, part, weapon, hp: room.hp[tSlot] });
+            if (room.hp[tSlot] <= 0) dmKill(code, room, tSlot, slot, weapon, part);
+            return;
+        }
+
         if (isSlotMode(room)) {
-            // 팀전/데스매치: 맞은 사람에게만 데미지를 전달. 같은 팀/이미 죽은 사람은 무시
+            // 팀전: 맞은 사람에게만 데미지를 전달. 같은 팀/이미 죽은 사람은 무시
             if (!room.started || room.matchOver || !room.alive[slot]) return;
             const tSlot = Number(data && data.target);
             if (!Number.isInteger(tSlot) || tSlot < 0 || tSlot >= room.n || !room.alive[tSlot]) return;
             if (room.teamOfSlot[tSlot] === room.teamOfSlot[slot]) return;
-            if (room.mode === 'dm' && Date.now() < room.inv[tSlot]) return; // 부활 직후 무적
             io.to(room.idOfSlot[tSlot]).emit('takeDamage', { damage: dmg, from: slot, part, weapon });
             return;
         }
@@ -1786,20 +2053,8 @@ io.on('connection', (socket) => {
         if (!room) return;
         const slot = slotOfSocket(room, socket);
 
-        if (room.mode === 'dm') {
-            if (!room.alive[slot]) return;
-            room.alive[slot] = false;
-            room.hp[slot] = 0;
-            room.diedAt[slot] = Date.now();
-            let killer = Number(data && data.killer);
-            if (!Number.isInteger(killer) || killer < 0 || killer >= room.n || killer === slot || !room.connected[killer]) killer = -1;
-            room.deaths[slot] += 1;
-            if (killer >= 0) room.kills[killer] += 1;
-            io.to(code).emit('playerDied', { slot, killer });
-            emitKillFeed(code, room, killer, slot, data && data.weapon, data && data.part);
-            emitDmScores(code, room);
-            return;
-        }
+        // 데스매치: 죽음은 서버가 체력으로 판정하므로 클라이언트의 보고는 받지 않음
+        if (room.mode === 'dm') return;
 
         if (room.mode === 'team') {
             if (!room.started || room.matchOver || !room.alive[slot]) return;
@@ -1814,29 +2069,13 @@ io.on('connection', (socket) => {
             return;
         }
 
+        // 1대1: 점수는 서버가 한 번만 정함. 둘이 거의 동시에 쓰러졌다면 무승부로 하고, 두 사람 화면에 똑같은 결과를 보냄
+        if (slot < 0 || slot > 1 || room.matchOver || room.deadInRound[slot]) return;
+        room.deadInRound[slot] = true;
+        room.hp[slot] = 0;
         socket.to(code).emit('enemyKilled');
-        if (slot >= 0) emitKillFeed(code, room, 1 - slot, slot, data && data.weapon, data && data.part);
-        if (slot >= 0) {
-            const winner = 1 - slot;
-            room.hp[slot] = 0;
-            room.score[winner] += 1;
-            specEmit(code, room, 'specDeath', { i: slot, score: room.score });
-            clearTimeout(room.resetTimer);
-            if (room.score[winner] >= WIN_SCORE) {
-                specEmit(code, room, 'specMatchEnd', { winner, score: room.score });
-                // [1.6] 경쟁전: 마지막 라운드가 끝나면 바로 결과를 기록
-                if (room.ranked && room.players[winner] && room.players[slot]) {
-                    settleRanked(room, room.players[winner], room.players[slot], null);
-                }
-            } else {
-                // 라운드가 다시 시작되는 시점(클라이언트가 약 1.5초 뒤 시작)에 체력을 되돌림
-                room.resetTimer = setTimeout(() => {
-                    if (rooms[code] !== room) return;
-                    room.hp = [100, 100];
-                    specEmit(code, room, 'specRound', { hp: room.hp });
-                }, 1600);
-            }
-        }
+        emitKillFeed(code, room, 1 - slot, slot, data && data.weapon, data && data.part);
+        if (!room.tradeTimer) room.tradeTimer = setTimeout(() => resolveDuelRound(code, room), TRADE_WINDOW_MS);
     });
 
     // 접속 해제 처리
