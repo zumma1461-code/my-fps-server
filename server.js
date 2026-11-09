@@ -27,9 +27,28 @@ const RANKED_ENABLED = false;   // 경쟁전은 일단 꺼 둠 (다시 켜려면
 const REQUIRED_VERSION = 'Beta 1.7';
 
 const API_TIMEOUT_MS = 20 * 1000;                                              // 앱스크립트가 처음 깰 때 느릴 수 있어 넉넉하게
-const READ_ACTIONS = new Set(['getFriends', 'getQuizzes', 'getSettings', 'getRanked', 'tokenLogin']); // 실패 시 한 번 더 시도해도 안전한 읽기 요청
+const READ_ACTIONS = new Set(['getFriends', 'getQuizzes', 'getSettings', 'getRanked', 'tokenLogin', 'getCosmetics']); // 실패 시 한 번 더 시도해도 안전한 읽기 요청
 
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+// ===== 치장품 (머리 장식) =====
+// 가격과 상품 목록은 서버가 정함 (화면에서 가격을 바꿔 보내도 소용없음)
+const COS_CATALOG = [
+    { id: 'cap', name: '야구 모자', price: 60 },
+    { id: 'bunny', name: '토끼 귀', price: 100 },
+    { id: 'horns', name: '악마 뿔', price: 150 },
+    { id: 'wizard', name: '마법사 모자', price: 180 },
+    { id: 'halo', name: '천사 고리', price: 220 },
+    { id: 'crown', name: '왕관', price: 400 }
+];
+const COS_BY_ID = new Map(COS_CATALOG.map(c => [c.id, c]));
+const COS_REWARD = 40;          // 문제를 하나 맞힐 때 받는 골드
+const COS_QUIZ_GAP_MS = 1500;   // 문제를 연달아 요청할 수 있는 최소 간격
+// 골드/구매 같은 요청에는 비밀값을 같이 보냄 (Code.gs 의 API_SECRET 과 같은 값을 Render 환경변수 ACCOUNT_API_SECRET 에 넣어두면,
+// 주소를 아는 사람이 앱스크립트에 직접 골드를 올리는 요청을 보내도 거절됨. 비워 두면 검사하지 않음)
+const COS_ACTIONS = new Set(['getCosmetics', 'addGold', 'buyCosmetic', 'equipCosmetic']);
+const API_SECRET = process.env.ACCOUNT_API_SECRET || '';
+const cosOf = (sock) => (sock && sock.cosmetic) || ''; // 이 사람이 장착한 치장품 (없으면 빈 문자열)
 
 // 앱스크립트 계정 API 호출 1회 - payload 객체를 그대로 JSON으로 전달
 async function callAccountApiOnce(payload) {
@@ -38,7 +57,7 @@ async function callAccountApiOnce(payload) {
         res = await fetch(ACCOUNT_API_URL, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(payload),
+            body: JSON.stringify(COS_ACTIONS.has(payload.action) ? Object.assign({}, payload, { secret: API_SECRET }) : payload),
             signal: AbortSignal.timeout(API_TIMEOUT_MS)
         });
     } catch (e) {
@@ -222,6 +241,7 @@ function clearUserSession(socket) {
     }
     socket.username = null;
     socket.friendSet = null;
+    socket.cosmetic = '';
 }
 
 // 각 소켓이 자기 친구 이름 집합(friendSet)을 들고 있어서, 상태가 바뀔 때 계정 서버를 부르지 않고도 즉시 알릴 수 있음
@@ -631,7 +651,6 @@ function emitKillFeed(code, room, killerSlot, victimSlot, weapon, part) {
             if (slot < 0) return { name: '', me: false, ally: false };
             let shown = nameAt(slot);
             const sameTeam = room.mode === 'team' ? room.teamOfSlot[slot] === room.teamOfSlot[sl] : slot === sl;
-            if (room.mode === 'team' && !sameTeam) shown = `적 ${room.idxOfSlot[slot] + 1}`;
             return { name: shown, me: slot === sl, ally: sameTeam };
         };
         io.to(id).emit('killFeed', { killer: view(killerSlot), victim: view(victimSlot), weapon, part });
@@ -704,8 +723,8 @@ function startDuel(a, b, opts) {
     console.log(`[대결 시작] ${opts.ranked ? '경쟁전' : '친구 대결'} ${a.username} vs ${b.username} (방 ${code})`);
     a.emit('challengeMatchStart', { code, isHost: true, ranked: !!opts.ranked });
     b.emit('challengeMatchStart', { code, isHost: false, ranked: !!opts.ranked });
-    a.emit('opponentName', { name: nameOf(b) });
-    b.emit('opponentName', { name: nameOf(a) });
+    a.emit('opponentName', { name: nameOf(b), cos: cosOf(b) });
+    b.emit('opponentName', { name: nameOf(a), cos: cosOf(a) });
     beginSkillPhase(code, room);
     io.to(code).emit('gameStart');
 
@@ -1013,13 +1032,13 @@ function joinDeathmatch(socket, room, code) {
     // 지금 살아 있는지도 같이 보내서, 새로 들어온 사람 화면에서 이미 죽은 사람이 서 있는 것처럼 보이지 않게 함
     const players = [];
     for (let sl = 0; sl < DM_MAX; sl++) {
-        if (room.connected[sl]) players.push({ slot: sl, name: room.nameOfSlot[sl], k: room.kills[sl], d: room.deaths[sl], alive: !!room.alive[sl] });
+        if (room.connected[sl]) players.push({ slot: sl, name: room.nameOfSlot[sl], k: room.kills[sl], d: room.deaths[sl], alive: !!room.alive[sl], cos: cosOf(sockById(room.idOfSlot[sl])) });
     }
     socket.emit('dmStart', {
         code, name: room.name, you: { slot }, players,
         map: { half: DM_HALF, boxes: DM_BOXES, spawns: DM_SPAWNS.map(s => [s.x, s.z]) }
     });
-    socket.to(code).emit('dmPlayerJoined', { slot, name: room.nameOfSlot[slot] });
+    socket.to(code).emit('dmPlayerJoined', { slot, name: room.nameOfSlot[slot], cos: cosOf(socket) });
     emitDmScores(code, room);
     broadcastRoomList();
     broadcastPresence(socket.username);
@@ -1036,6 +1055,18 @@ function applyLogin(socket, name) {
     onlineUsers.set(name, socket);
     broadcastPresence(name);
     loadFriendSet(socket);
+    socket.cosmetic = '';
+    loadCosmetics(socket); // 장착한 치장품은 뒤에서 불러옴
+}
+
+async function loadCosmetics(socket) {
+    const name = socket.username;
+    if (!name) return;
+    try {
+        const r = await callAccountApi({ action: 'getCosmetics', username: name });
+        if (socket.username !== name) return;
+        socket.cosmetic = (r && r.success && COS_BY_ID.has(r.equipped) && (r.owned || []).includes(r.equipped)) ? r.equipped : '';
+    } catch (e) { /* 못 불러오면 장착 없음으로 둠 */ }
 }
 
 // 로그인 응답을 먼저 보낸 뒤 뒤에서 토큰을 발급해 따로 전달 (로그인이 느려지지 않도록)
@@ -1332,6 +1363,121 @@ io.on('connection', (socket) => {
         }
     });
 
+    // ===== 치장품 상점 (로그인한 사람만) =====
+    // 골드는 문제를 맞혀야 얻고, 문제 출제/정답 확인/골드 계산/구매는 전부 서버가 함 (화면에서는 정답을 알 수 없음)
+    const cosFail = (event, message) => socket.emit(event, { success: false, message });
+
+    async function sendCosData() {
+        if (!socket.username) return;
+        try {
+            const r = await callAccountApi({ action: 'getCosmetics', username: socket.username });
+            if (!r || !r.success) throw new Error('getCosmetics failed');
+            const owned = r.owned || [];
+            socket.cosmetic = (COS_BY_ID.has(r.equipped) && owned.includes(r.equipped)) ? r.equipped : '';
+            socket.emit('cosData', { success: true, gold: r.gold, owned, equipped: socket.cosmetic, catalog: COS_CATALOG, reward: COS_REWARD });
+        } catch (e) {
+            socket.emit('cosData', { success: false, message: '계정 서버 연결 실패' });
+        }
+    }
+
+    socket.on('cosGet', () => {
+        if (!socket.username) { socket.emit('cosData', { success: false, message: '로그인이 필요합니다.' }); return; }
+        sendCosData();
+    });
+
+    // 문제 하나를 내줌 (정답은 서버에만 보관)
+    socket.on('cosQuiz', async () => {
+        if (!socket.username) { socket.emit('cosQuizData', { success: false, message: '로그인이 필요합니다.' }); return; }
+        const now = Date.now();
+        if (socket.cosQuizAt && now - socket.cosQuizAt < COS_QUIZ_GAP_MS) return; // 너무 빨리 연달아 요청하는 것 방지
+        socket.cosQuizAt = now;
+        try {
+            const r = await getQuizzesCached();
+            let list = (r && r.success && Array.isArray(r.quizzes)) ? r.quizzes : [];
+            list = list.filter(q => {
+                if (!q || typeof q.prompt !== 'string' || q.prompt.trim() === '') return false;
+                if (q.type === 'short') return true;
+                const n = q.type === 'choice2' ? 2 : (q.type === 'choice4' ? 4 : 0);
+                const a = parseInt(q.answer, 10);
+                return n > 0 && Array.isArray(q.choices) && q.choices.length === n && a >= 1 && a <= n;
+            });
+            if (list.length === 0) { socket.cosQuiz = null; socket.emit('cosQuizData', { success: false, message: '등록된 문제가 없어요.' }); return; }
+
+            // 최근에 낸 문제는 피해서 같은 문제가 연달아 나오지 않게 함
+            const seen = socket.cosSeen || (socket.cosSeen = []);
+            let pool = list.filter(q => !seen.includes(q.prompt));
+            if (pool.length === 0) { seen.length = 0; pool = list; }
+            const q = pool[Math.floor(Math.random() * pool.length)];
+            seen.push(q.prompt);
+            if (seen.length > 200) seen.shift();
+
+            if (q.type === 'short') {
+                socket.cosQuiz = { type: 'short', answer: String(q.answer == null ? '' : q.answer).trim() };
+                socket.emit('cosQuizData', { success: true, type: 'short', prompt: q.prompt });
+            } else {
+                // 보기 순서는 매번 섞고, 섞인 순서에 맞는 정답 번호를 서버에 기억해 둠
+                const correctIdx = parseInt(q.answer, 10) - 1;
+                const order = q.choices.map((_, i) => i);
+                for (let i = order.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); const t = order[i]; order[i] = order[j]; order[j] = t; }
+                socket.cosQuiz = { type: q.type, answer: order.indexOf(correctIdx) + 1 };
+                socket.emit('cosQuizData', { success: true, type: q.type, prompt: q.prompt, choices: order.map(i => String(q.choices[i])) });
+            }
+        } catch (e) {
+            socket.emit('cosQuizData', { success: false, message: '문제를 불러오지 못했습니다.' });
+        }
+    });
+
+    // 정답 확인 - 한 문제에 한 번만 답할 수 있고, 맞히면 서버가 골드를 올려 줌
+    socket.on('cosAnswer', async (d) => {
+        const quiz = socket.cosQuiz;
+        socket.cosQuiz = null;
+        if (!socket.username || !quiz) { socket.emit('cosAnswerResult', { success: false, message: '풀고 있는 문제가 없습니다.' }); return; }
+        let correct = false;
+        if (quiz.type === 'short') {
+            const given = String((d && d.answer) == null ? '' : d.answer).trim();
+            correct = given !== '' && given === quiz.answer;
+        } else {
+            correct = Number(d && d.choice) === quiz.answer;
+        }
+        if (!correct) { socket.emit('cosAnswerResult', { success: true, correct: false }); return; }
+        try {
+            const r = await callAccountApi({ action: 'addGold', username: socket.username, amount: COS_REWARD });
+            if (!r || !r.success) throw new Error('addGold failed');
+            socket.emit('cosAnswerResult', { success: true, correct: true, reward: COS_REWARD, gold: r.gold });
+        } catch (e) {
+            socket.emit('cosAnswerResult', { success: true, correct: true, reward: 0, message: '정답이지만 골드를 저장하지 못했습니다. 잠시 후 다시 시도해주세요.' });
+        }
+    });
+
+    socket.on('cosBuy', async (d) => {
+        if (!socket.username) { cosFail('cosActionResult', '로그인이 필요합니다.'); return; }
+        const item = COS_BY_ID.get(String(d && d.id));
+        if (!item) { cosFail('cosActionResult', '없는 상품입니다.'); return; }
+        try {
+            const r = await callAccountApi({ action: 'buyCosmetic', username: socket.username, id: item.id, price: item.price });
+            const okBuy = !!(r && r.success);
+            socket.emit('cosActionResult', { success: okBuy, message: (r && r.message) || (okBuy ? item.name + ' 구매 완료!' : '구매하지 못했습니다.') });
+        } catch (e) {
+            cosFail('cosActionResult', '계정 서버 연결 실패');
+        }
+        sendCosData();
+    });
+
+    socket.on('cosEquip', async (d) => {
+        if (!socket.username) { cosFail('cosActionResult', '로그인이 필요합니다.'); return; }
+        const id = d && d.id ? String(d.id) : '';
+        if (id && !COS_BY_ID.has(id)) { cosFail('cosActionResult', '없는 상품입니다.'); return; }
+        try {
+            const r = await callAccountApi({ action: 'equipCosmetic', username: socket.username, id });
+            const okEq = !!(r && r.success);
+            if (okEq) socket.cosmetic = id;
+            socket.emit('cosActionResult', { success: okEq, message: (r && r.message) || (okEq ? (id ? COS_BY_ID.get(id).name + ' 장착!' : '치장품을 벗었습니다.') : '장착하지 못했습니다.') });
+        } catch (e) {
+            cosFail('cosActionResult', '계정 서버 연결 실패');
+        }
+        sendCosData();
+    });
+
     // ===== 친구 기능 (로그인한 사용자만) =====
     socket.on('getFriends', async () => {
         if (!socket.username) { socket.emit('friendsData', { success: false, message: '로그인이 필요합니다.' }); return; }
@@ -1596,6 +1742,7 @@ io.on('connection', (socket) => {
             mode: room.mode,
             players: room.mode === 'team' ? room.nameOfSlot.slice() : [playerNameAt(room, 0), playerNameAt(room, 1)],
             teams: room.mode === 'team' ? room.teamOfSlot.slice() : [0, 1],
+            cos: room.mode === 'team' ? room.idOfSlot.map(id => cosOf(sockById(id))) : room.players.map(id => cosOf(sockById(id))),
             positions: room.last,
             weapons: room.weapon,
             hp: room.hp,
@@ -1696,8 +1843,8 @@ io.on('connection', (socket) => {
         beginSkillPhase(roomCode, room);
         if (room.players.length === 2) {
             const s0 = sockById(room.players[0]);
-            if (s0) s0.emit('opponentName', { name: nameOf(socket) });
-            socket.emit('opponentName', { name: nameOf(s0) });
+            if (s0) s0.emit('opponentName', { name: nameOf(socket), cos: cosOf(socket) });
+            socket.emit('opponentName', { name: nameOf(s0), cos: cosOf(s0) });
         }
         io.to(roomCode).emit('gameStart');
         broadcastPresence(socket.username);
@@ -1765,12 +1912,13 @@ io.on('connection', (socket) => {
         cancelInvitesForRoom(code);
         beginSkillPhase(code, room); // 모두 스킬을 골라야 첫 라운드가 시작됨
 
-        // 게임 중에는 상대 팀 닉네임이 보이지 않도록, 받는 사람마다 상대 팀 이름을 "적 N"으로 바꿔서 보냄
+        // 모든 플레이어의 닉네임과 장착한 치장품을 같이 보냄
         room.idOfSlot.forEach((id, slot) => {
             const myTeam = room.teamOfSlot[slot];
             const roster = room.idOfSlot.map((_, sl) => ({
                 slot: sl,
-                name: room.teamOfSlot[sl] === myTeam ? room.nameOfSlot[sl] : `적 ${room.idxOfSlot[sl] + 1}`,
+                name: room.nameOfSlot[sl],
+                cos: cosOf(sockById(room.idOfSlot[sl])),
                 team: room.teamOfSlot[sl],
                 idx: room.idxOfSlot[sl]
             }));
